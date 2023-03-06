@@ -8,1515 +8,6 @@ SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
 
-IF OBJECT_ID('dbo.sp_AllNightLog') IS NULL
-  EXEC ('CREATE PROCEDURE dbo.sp_AllNightLog AS RETURN 0;')
-GO
-
-
-ALTER PROCEDURE dbo.sp_AllNightLog
-								@PollForNewDatabases BIT = 0, /* Formerly Pollster */
-								@Backup BIT = 0, /* Formerly LogShaming */
-								@PollDiskForNewDatabases BIT = 0,
-								@Restore BIT = 0,
-								@Debug BIT = 0,
-								@Help BIT = 0,
-								@Version                 VARCHAR(30) = NULL OUTPUT,
-								@VersionDate             DATETIME = NULL OUTPUT,
-								@VersionCheckMode        BIT = 0
-WITH RECOMPILE
-AS
-SET NOCOUNT ON;
-SET STATISTICS XML OFF;
-
-BEGIN;
-
-
-SELECT @Version = '8.11', @VersionDate = '20221013';
-
-IF(@VersionCheckMode = 1)
-BEGIN
-	RETURN;
-END;
-
-IF @Help = 1
-
-BEGIN
-
-	PRINT '		
-		/*
-
-
-		sp_AllNightLog from http://FirstResponderKit.org
-		
-		* @PollForNewDatabases = 1 polls sys.databases for new entries
-			* Unfortunately no other way currently to automate new database additions when restored from backups
-				* No triggers or extended events that easily do this
-	
-		* @Backup = 1 polls msdbCentral.dbo.backup_worker for databases not backed up in [RPO], takes LOG backups
-			* Will switch to a full backup if none exists
-	
-	
-		To learn more, visit http://FirstResponderKit.org where you can download new
-		versions for free, watch training videos on how it works, get more info on
-		the findings, contribute your own code, and more.
-	
-		Known limitations of this version:
-		 - Only Microsoft-supported versions of SQL Server. Sorry, 2005 and 2000! And really, maybe not even anything less than 2016. Heh.
-         - When restoring encrypted backups, the encryption certificate must already be installed.
-	
-		Unknown limitations of this version:
-		 - None.  (If we knew them, they would be known. Duh.)
-	
-	     Changes - for the full list of improvements and fixes in this version, see:
-	     https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
-	
-	
-		Parameter explanations:
-	
-		  @PollForNewDatabases BIT, defaults to 0. When this is set to 1, runs in a perma-loop to find new entries in sys.databases 
-		  @Backup BIT, defaults to 0. When this is set to 1, runs in a perma-loop checking the backup_worker table for databases that need to be backed up
-		  @Debug BIT, defaults to 0. Whent this is set to 1, it prints out dynamic SQL commands
-		  @RPOSeconds BIGINT, defaults to 30. Value in seconds you want to use to determine if a new log backup needs to be taken.
-		  @BackupPath NVARCHAR(MAX), defaults to = ''D:\Backup''. You 99.99999% will need to change this path to something else. This tells Ola''s job where to put backups.
-	
-		For more documentation: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
-	
-	    MIT License
-		
-		Copyright (c) 2021 Brent Ozar Unlimited
-	
-		Permission is hereby granted, free of charge, to any person obtaining a copy
-		of this software and associated documentation files (the "Software"), to deal
-		in the Software without restriction, including without limitation the rights
-		to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-		copies of the Software, and to permit persons to whom the Software is
-		furnished to do so, subject to the following conditions:
-	
-		The above copyright notice and this permission notice shall be included in all
-		copies or substantial portions of the Software.
-	
-		THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-		IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-		FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-		AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-		LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-		OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-		SOFTWARE.
-
-
-		*/';
-
-RETURN
-END
-
-DECLARE	@database NVARCHAR(128) = NULL; --Holds the database that's currently being processed
-DECLARE @error_number INT = NULL; --Used for TRY/CATCH
-DECLARE @error_severity INT; --Used for TRY/CATCH
-DECLARE @error_state INT; --Used for TRY/CATCH
-DECLARE @msg NVARCHAR(4000) = N''; --Used for RAISERROR
-DECLARE @rpo INT; --Used to hold the RPO value in our configuration table
-DECLARE @rto INT; --Used to hold the RPO value in our configuration table
-DECLARE @backup_path NVARCHAR(MAX); --Used to hold the backup path in our configuration table
-DECLARE @changebackuptype NVARCHAR(MAX); --Config table: Y = escalate to full backup, MSDB = escalate if MSDB history doesn't show a recent full.
-DECLARE @encrypt NVARCHAR(MAX); --Config table: Y = encrypt the backup. N (default) = do not encrypt.
-DECLARE @encryptionalgorithm NVARCHAR(MAX); --Config table: native 2014 choices include TRIPLE_DES_3KEY, AES_128, AES_192, AES_256
-DECLARE @servercertificate NVARCHAR(MAX); --Config table: server certificate that is used to encrypt the backup
-DECLARE @restore_path_base NVARCHAR(MAX); --Used to hold the base backup path in our configuration table
-DECLARE @restore_path_full NVARCHAR(MAX); --Used to hold the full backup path in our configuration table
-DECLARE @restore_path_log NVARCHAR(MAX); --Used to hold the log backup path in our configuration table
-DECLARE @restore_move_files INT; -- used to hold the move files bit in our configuration table
-DECLARE @db_sql NVARCHAR(MAX) = N''; --Used to hold the dynamic SQL to create msdbCentral
-DECLARE @tbl_sql NVARCHAR(MAX) = N''; --Used to hold the dynamic SQL that creates tables in msdbCentral
-DECLARE @database_name NVARCHAR(256) = N'msdbCentral'; --Used to hold the name of the database we create to centralize data
-													   --Right now it's hardcoded to msdbCentral, but I made it dynamic in case that changes down the line
-DECLARE @cmd NVARCHAR(4000) = N'' --Holds dir cmd 
-DECLARE @FileList TABLE ( BackupFile NVARCHAR(255) ); --Where we dump @cmd
-DECLARE @restore_full BIT = 0 --We use this one
-DECLARE @only_logs_after NVARCHAR(30) = N''
-
-
-
-/*
-
-Make sure we're doing something
-
-*/
-
-IF (
-		  @PollForNewDatabases = 0
-	  AND @PollDiskForNewDatabases = 0
-	  AND @Backup = 0
-	  AND @Restore = 0
-	  AND @Help = 0
-)
-		BEGIN 		
-			RAISERROR('You don''t seem to have picked an action for this stored procedure to take.', 0, 1) WITH NOWAIT
-			
-			RETURN;
-		END 
-
-/*
-Make sure xp_cmdshell is enabled
-*/
-IF NOT EXISTS (SELECT * FROM sys.configurations WHERE name = 'xp_cmdshell' AND value_in_use = 1)
-		BEGIN 		
-			RAISERROR('xp_cmdshell must be enabled so we can get directory contents to check for new databases to restore.', 0, 1) WITH NOWAIT
-			
-			RETURN;
-		END 
-
-/*
-Make sure Ola Hallengren's scripts are installed in same database
-*/
-DECLARE @CurrentDatabaseContext nvarchar(128) = DB_NAME();
-IF NOT EXISTS (SELECT * FROM sys.procedures WHERE name = 'CommandExecute')
-		BEGIN 		
-			RAISERROR('Ola Hallengren''s CommandExecute must be installed in the same database (%s) as SQL Server First Responder Kit. More info: http://ola.hallengren.com', 0, 1, @CurrentDatabaseContext) WITH NOWAIT;
-			
-			RETURN;
-		END 
-IF NOT EXISTS (SELECT * FROM sys.procedures WHERE name = 'DatabaseBackup')
-		BEGIN 		
-			RAISERROR('Ola Hallengren''s DatabaseBackup must be installed in the same database (%s) as SQL Server First Responder Kit. More info: http://ola.hallengren.com', 0, 1, @CurrentDatabaseContext) WITH NOWAIT;
-			
-			RETURN;
-		END 
-
-/*
-Make sure sp_DatabaseRestore is installed in same database
-*/
-IF NOT EXISTS (SELECT * FROM sys.procedures WHERE name = 'sp_DatabaseRestore')
-		BEGIN 		
-			RAISERROR('sp_DatabaseRestore must be installed in the same database (%s) as SQL Server First Responder Kit. To get it: http://FirstResponderKit.org', 0, 1, @CurrentDatabaseContext) WITH NOWAIT;
-			
-			RETURN;
-		END 
-
-
-IF (@PollDiskForNewDatabases = 1 OR @Restore = 1) AND OBJECT_ID('msdb.dbo.restore_configuration') IS NOT NULL
-    BEGIN
-
-		IF @Debug = 1 RAISERROR('Checking restore path', 0, 1) WITH NOWAIT;
-
-		SELECT @restore_path_base = CONVERT(NVARCHAR(512), configuration_setting)
-		FROM msdb.dbo.restore_configuration c
-		WHERE configuration_name = N'log restore path';
-
-
-		IF @restore_path_base IS NULL
-			BEGIN
-				RAISERROR('@restore_path cannot be NULL. Please check the msdb.dbo.restore_configuration table', 0, 1) WITH NOWAIT;
-				RETURN;
-			END;
-
-        IF CHARINDEX('**', @restore_path_base) <> 0
-            BEGIN
-
-                /* If they passed in a dynamic **DATABASENAME**, stop at that folder looking for databases. More info: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/993 */
-                IF CHARINDEX('**DATABASENAME**', @restore_path_base) <> 0
-                    BEGIN
-                    SET @restore_path_base = SUBSTRING(@restore_path_base, 1, CHARINDEX('**DATABASENAME**',@restore_path_base) - 2);
-                    END;
-
-                SET @restore_path_base = REPLACE(@restore_path_base, '**AVAILABILITYGROUP**', '');
-                SET @restore_path_base = REPLACE(@restore_path_base, '**BACKUPTYPE**', 'FULL');
-                SET @restore_path_base = REPLACE(@restore_path_base, '**SERVERNAME**', REPLACE(CAST(SERVERPROPERTY('servername') AS nvarchar(max)),'\','$'));
-
-                IF CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max))) > 0
-                    BEGIN
-                        SET @restore_path_base = REPLACE(@restore_path_base, '**SERVERNAMEWITHOUTINSTANCE**', SUBSTRING(CAST(SERVERPROPERTY('servername') AS nvarchar(max)), 1, (CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max))) - 1)));
-                        SET @restore_path_base = REPLACE(@restore_path_base, '**INSTANCENAME**', SUBSTRING(CAST(SERVERPROPERTY('servername') AS nvarchar(max)), CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max))), (LEN(CAST(SERVERPROPERTY('servername') AS nvarchar(max))) - CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max)))) + 1));
-                    END
-                    ELSE /* No instance installed */
-                    BEGIN
-                        SET @restore_path_base = REPLACE(@restore_path_base, '**SERVERNAMEWITHOUTINSTANCE**', CAST(SERVERPROPERTY('servername') AS nvarchar(max)));
-                        SET @restore_path_base = REPLACE(@restore_path_base, '**INSTANCENAME**', 'DEFAULT');
-                    END
-
-                IF CHARINDEX('**CLUSTER**', @restore_path_base) <> 0
-                    BEGIN
-                    DECLARE @ClusterName NVARCHAR(128);
-                    IF EXISTS(SELECT * FROM sys.all_objects WHERE name = 'dm_hadr_cluster')
-                        BEGIN
-                            SELECT @ClusterName = cluster_name FROM sys.dm_hadr_cluster;
-                        END
-                    SET @restore_path_base = REPLACE(@restore_path_base, '**CLUSTER**', COALESCE(@ClusterName,''));
-                    END;
-
-            END /* IF CHARINDEX('**', @restore_path_base) <> 0 */
-		
-		SELECT @restore_move_files = CONVERT(BIT, configuration_setting)
-		FROM msdb.dbo.restore_configuration c
-		WHERE configuration_name = N'move files';
-		
-		IF @restore_move_files is NULL
-		BEGIN
-			-- Set to default value of 1
-			SET @restore_move_files = 1
-		END
-
-    END /* IF @PollDiskForNewDatabases = 1 OR @Restore = 1 */
-
-
-/*
-
-Certain variables necessarily skip to parts of this script that are irrelevant
-in both directions to each other. They are used for other stuff.
-
-*/
-
-
-/*
-
-Pollster use happens strictly to check for new databases in sys.databases to place them in a worker queue
-
-*/
-
-IF @PollForNewDatabases = 1
-	GOTO Pollster;
-
-/*
-
-LogShamer happens when we need to find and assign work to a worker job for backups
-
-*/
-
-IF @Backup = 1
-	GOTO LogShamer;
-
-/*
-
-Pollster use happens strictly to check for new databases in sys.databases to place them in a worker queue
-
-*/
-
-IF @PollDiskForNewDatabases = 1
-	GOTO DiskPollster;
-
-
-/*
-
-Restoregasm Addict happens when we need to find and assign work to a worker job for restores
-
-*/
-
-IF @Restore = 1
-	GOTO Restoregasm_Addict;
-
-
-
-/*
-
-Begin Polling section
-
-*/
-
-
-
-/*
-
-This section runs in a loop checking for new databases added to the server, or broken backups
-
-*/
-
-
-Pollster:
-
-	IF @Debug = 1 RAISERROR('Beginning Pollster', 0, 1) WITH NOWAIT;
-	
-	IF OBJECT_ID('msdbCentral.dbo.backup_worker') IS NOT NULL
-	
-		BEGIN
-		
-			WHILE @PollForNewDatabases = 1
-			
-			BEGIN
-				
-				BEGIN TRY
-			
-					IF @Debug = 1 RAISERROR('Checking for new databases...', 0, 1) WITH NOWAIT;
-
-					/*
-					
-					Look for new non-system databases -- there should probably be additional filters here for accessibility, etc.
-
-					*/
-	
-						INSERT msdbCentral.dbo.backup_worker (database_name) 
-						SELECT d.name
-						FROM sys.databases d
-						WHERE NOT EXISTS (
-							SELECT 1 
-							FROM msdbCentral.dbo.backup_worker bw
-							WHERE bw.database_name = d.name
-										)
-						AND d.database_id > 4;
-
-						IF @Debug = 1 RAISERROR('Checking for wayward databases', 0, 1) WITH NOWAIT;
-
-						/*
-							
-						This section aims to find databases that have
-							* Had a log backup ever (the default for finish time is 9999-12-31, so anything with a more recent finish time has had a log backup)
-							* Not had a log backup start in the last 5 minutes (this could be trouble! or a really big log backup)
-							* Also checks msdb.dbo.backupset to make sure the database has a full backup associated with it (otherwise it's the first full, and we don't need to start taking log backups yet)
-
-						*/
-	
-						IF EXISTS (
-								
-							SELECT 1
-							FROM msdbCentral.dbo.backup_worker bw WITH (READPAST)
-							WHERE bw.last_log_backup_finish_time < '99991231'
-							AND bw.last_log_backup_start_time < DATEADD(SECOND, (@rpo * -1), GETDATE())				
-							AND EXISTS (
-									SELECT 1
-									FROM msdb.dbo.backupset b
-									WHERE b.database_name = bw.database_name
-									AND b.type = 'D'
-										)								
-								)
-	
-							BEGIN
-									
-								IF @Debug = 1 RAISERROR('Resetting databases with a log backup and no log backup in the last 5 minutes', 0, 1) WITH NOWAIT;
-
-	
-									UPDATE bw
-											SET bw.is_started = 0,
-												bw.is_completed = 1,
-												bw.last_log_backup_start_time = '19000101'
-									FROM msdbCentral.dbo.backup_worker bw
-									WHERE bw.last_log_backup_finish_time < '99991231'
-									AND bw.last_log_backup_start_time < DATEADD(SECOND, (@rpo * -1), GETDATE())
-									AND EXISTS (
-											SELECT 1
-											FROM msdb.dbo.backupset b
-											WHERE b.database_name = bw.database_name
-											AND b.type = 'D'
-												);
-
-								
-								END; --End check for wayward databases
-
-						/*
-						
-						Wait 1 minute between runs, we don't need to be checking this constantly
-						
-						*/
-
-	
-					IF @Debug = 1 RAISERROR('Waiting for 1 minute', 0, 1) WITH NOWAIT;
-					
-					WAITFOR DELAY '00:01:00.000';
-
-				END TRY
-
-				BEGIN CATCH
-
-
-						SELECT @msg = N'Error inserting databases to msdbCentral.dbo.backup_worker, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
-							   @error_severity = ERROR_SEVERITY(), 
-							   @error_state = ERROR_STATE();
-						
-						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
-
-	
-						WHILE @@TRANCOUNT > 0
-							ROLLBACK;
-
-
-				END CATCH;
-	
-			
-			END; 
-
-        /* Check to make sure job is still enabled */
-		IF NOT EXISTS (
-						SELECT *
-						FROM msdb.dbo.sysjobs 
-						WHERE name = 'sp_AllNightLog_PollForNewDatabases'
-                        AND enabled = 1
-						)
-            BEGIN
-				RAISERROR('sp_AllNightLog_PollForNewDatabases job is disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
-				RETURN;
-            END        
-		
-		END;-- End Pollster loop
-	
-		ELSE
-	
-			BEGIN
-	
-				RAISERROR('msdbCentral.dbo.backup_worker does not exist, please create it.', 0, 1) WITH NOWAIT;
-				RETURN;
-			
-			END; 
-	RETURN;
-
-
-/*
-
-End of Pollster
-
-*/
-
-
-/*
-
-Begin DiskPollster
-
-*/
-
-
-/*
-
-This section runs in a loop checking restore path for new databases added to the server, or broken restores
-
-*/
-
-DiskPollster:
-
-	IF @Debug = 1 RAISERROR('Beginning DiskPollster', 0, 1) WITH NOWAIT;
-	
-	IF OBJECT_ID('msdb.dbo.restore_configuration') IS NOT NULL
-	
-		BEGIN
-		
-			WHILE @PollDiskForNewDatabases = 1
-			
-			BEGIN
-				
-				BEGIN TRY
-			
-					IF @Debug = 1 RAISERROR('Checking for new databases in: ', 0, 1) WITH NOWAIT;
-					IF @Debug = 1 RAISERROR(@restore_path_base, 0, 1) WITH NOWAIT;
-
-					/*
-					
-					Look for new non-system databases -- there should probably be additional filters here for accessibility, etc.
-
-					*/
-						
-						/*
-						
-						This setups up the @cmd variable to check the restore path for new folders
-						
-						In our case, a new folder means a new database, because we assume a pristine path
-
-						*/
-
-						SET @cmd = N'DIR /b "' + @restore_path_base + N'"';
-						
-									IF @Debug = 1
-									BEGIN
-										PRINT @cmd;
-									END  
-						
-						
-                        DELETE @FileList;
-						INSERT INTO @FileList (BackupFile)
-						EXEC master.sys.xp_cmdshell @cmd; 
-						
-						IF (
-							SELECT COUNT(*) 
-							FROM @FileList AS fl 
-							WHERE fl.BackupFile = 'The system cannot find the path specified.'
-							OR fl.BackupFile = 'File Not Found'
-							) = 1
-
-							BEGIN
-						
-								RAISERROR('No rows were returned for that database\path', 0, 1) WITH NOWAIT;
-
-							END;
-
-						IF (
-							SELECT COUNT(*) 
-							FROM @FileList AS fl 
-							WHERE fl.BackupFile = 'Access is denied.'
-							) = 1
-
-							BEGIN
-						
-								RAISERROR('Access is denied to %s', 16, 1, @restore_path_base) WITH NOWAIT;
-
-							END;
-
-						IF (
-							SELECT COUNT(*) 
-							FROM @FileList AS fl 
-							) = 1
-						AND (
-							SELECT COUNT(*) 
-							FROM @FileList AS fl 							
-							WHERE fl.BackupFile IS NULL
-							) = 1
-
-							BEGIN
-	
-								RAISERROR('That directory appears to be empty', 0, 1) WITH NOWAIT;
-	
-								RETURN;
-	
-							END
-
-						IF (
-							SELECT COUNT(*) 
-							FROM @FileList AS fl 
-							WHERE fl.BackupFile = 'The user name or password is incorrect.'
-							) = 1
-
-							BEGIN
-						
-								RAISERROR('Incorrect user name or password for %s', 16, 1, @restore_path_base) WITH NOWAIT;
-
-							END;
-
-						INSERT msdb.dbo.restore_worker (database_name) 
-						SELECT fl.BackupFile
-						FROM @FileList AS fl
-						WHERE fl.BackupFile IS NOT NULL
-						AND fl.BackupFile COLLATE DATABASE_DEFAULT NOT IN (SELECT name from sys.databases where database_id < 5)
-						AND NOT EXISTS
-							(
-							SELECT 1
-							FROM msdb.dbo.restore_worker rw
-							WHERE rw.database_name = fl.BackupFile
-							)
-
-						IF @Debug = 1 RAISERROR('Checking for wayward databases', 0, 1) WITH NOWAIT;
-
-						/*
-							
-						This section aims to find databases that have
-							* Had a log restore ever (the default for finish time is 9999-12-31, so anything with a more recent finish time has had a log restore)
-							* Not had a log restore start in the last 5 minutes (this could be trouble! or a really big log restore)
-							* Also checks msdb.dbo.backupset to make sure the database has a full backup associated with it (otherwise it's the first full, and we don't need to start adding log restores yet)
-
-						*/
-	
-						IF EXISTS (
-								
-							SELECT 1
-							FROM msdb.dbo.restore_worker rw WITH (READPAST)
-							WHERE rw.last_log_restore_finish_time < '99991231'
-							AND rw.last_log_restore_start_time < DATEADD(SECOND, (@rto * -1), GETDATE())			
-							AND EXISTS (
-									SELECT 1
-									FROM msdb.dbo.restorehistory r
-									WHERE r.destination_database_name = rw.database_name
-									AND r.restore_type = 'D'
-										)								
-								)
-	
-							BEGIN
-									
-								IF @Debug = 1 RAISERROR('Resetting databases with a log restore and no log restore in the last 5 minutes', 0, 1) WITH NOWAIT;
-
-	
-									UPDATE rw
-											SET rw.is_started = 0,
-												rw.is_completed = 1,
-												rw.last_log_restore_start_time = '19000101'
-									FROM msdb.dbo.restore_worker rw
-									WHERE rw.last_log_restore_finish_time < '99991231'
-									AND rw.last_log_restore_start_time < DATEADD(SECOND, (@rto * -1), GETDATE())
-									AND EXISTS (
-											SELECT 1
-											FROM msdb.dbo.restorehistory r
-											WHERE r.destination_database_name = rw.database_name
-											AND r.restore_type = 'D'
-												);
-
-								
-								END; --End check for wayward databases
-
-						/*
-						
-						Wait 1 minute between runs, we don't need to be checking this constantly
-						
-						*/
-
-                    /* Check to make sure job is still enabled */
-		            IF NOT EXISTS (
-						            SELECT *
-						            FROM msdb.dbo.sysjobs 
-						            WHERE name = 'sp_AllNightLog_PollDiskForNewDatabases'
-                                    AND enabled = 1
-						            )
-                        BEGIN
-				            RAISERROR('sp_AllNightLog_PollDiskForNewDatabases job is disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
-				            RETURN;
-                        END        
-	
-					IF @Debug = 1 RAISERROR('Waiting for 1 minute', 0, 1) WITH NOWAIT;
-					
-					WAITFOR DELAY '00:01:00.000';
-
-				END TRY
-
-				BEGIN CATCH
-
-
-						SELECT @msg = N'Error inserting databases to msdb.dbo.restore_worker, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
-							   @error_severity = ERROR_SEVERITY(), 
-							   @error_state = ERROR_STATE();
-						
-						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
-
-	
-						WHILE @@TRANCOUNT > 0
-							ROLLBACK;
-
-
-				END CATCH;
-	
-			
-			END; 
-		
-		END;-- End Pollster loop
-	
-		ELSE
-	
-			BEGIN
-	
-				RAISERROR('msdb.dbo.restore_worker does not exist, please create it.', 0, 1) WITH NOWAIT;
-				RETURN;
-			
-			END; 
-	RETURN;
-
-
-
-/*
-
-Begin LogShamer
-
-*/
-
-LogShamer:
-
-	IF @Debug = 1 RAISERROR('Beginning Backups', 0, 1) WITH NOWAIT;
-	
-	IF OBJECT_ID('msdbCentral.dbo.backup_worker') IS NOT NULL
-	
-		BEGIN
-		
-			/*
-			
-			Make sure configuration table exists...
-			
-			*/
-	
-			IF OBJECT_ID('msdbCentral.dbo.backup_configuration') IS NOT NULL
-	
-				BEGIN
-	
-					IF @Debug = 1 RAISERROR('Checking variables', 0, 1) WITH NOWAIT;
-		
-			/*
-			
-			These settings are configurable
-	
-			I haven't found a good way to find the default backup path that doesn't involve xp_regread
-			
-			*/
-	
-						SELECT @rpo  = CONVERT(INT, configuration_setting)
-						FROM msdbCentral.dbo.backup_configuration c
-						WHERE configuration_name = N'log backup frequency'
-                          AND database_name = N'all';
-	
-							
-							IF @rpo IS NULL
-								BEGIN
-									RAISERROR('@rpo cannot be NULL. Please check the msdbCentral.dbo.backup_configuration table', 0, 1) WITH NOWAIT;
-									RETURN;
-								END;	
-	
-	
-						SELECT @backup_path = CONVERT(NVARCHAR(512), configuration_setting)
-						FROM msdbCentral.dbo.backup_configuration c
-						WHERE configuration_name = N'log backup path'
-                          AND database_name = N'all';
-	
-							
-							IF @backup_path IS NULL
-								BEGIN
-									RAISERROR('@backup_path cannot be NULL. Please check the msdbCentral.dbo.backup_configuration table', 0, 1) WITH NOWAIT;
-									RETURN;
-								END;	
-
-						SELECT @changebackuptype = configuration_setting
-						FROM msdbCentral.dbo.backup_configuration c
-						WHERE configuration_name = N'change backup type'
-                          AND database_name = N'all';
-
-						SELECT @encrypt = configuration_setting
-						FROM msdbCentral.dbo.backup_configuration c
-						WHERE configuration_name = N'encrypt'
-                          AND database_name = N'all';
-
-						SELECT @encryptionalgorithm = configuration_setting
-						FROM msdbCentral.dbo.backup_configuration c
-						WHERE configuration_name = N'encryptionalgorithm'
-                          AND database_name = N'all';
-
-						SELECT @servercertificate = configuration_setting
-						FROM msdbCentral.dbo.backup_configuration c
-						WHERE configuration_name = N'servercertificate'
-                          AND database_name = N'all';
-
-							IF @encrypt = N'Y' AND (@encryptionalgorithm IS NULL OR @servercertificate IS NULL)
-								BEGIN
-									RAISERROR('If encryption is Y, then both the encryptionalgorithm and servercertificate must be set. Please check the msdbCentral.dbo.backup_configuration table', 0, 1) WITH NOWAIT;
-									RETURN;
-								END;	
-	
-				END;
-	
-			ELSE
-	
-				BEGIN
-	
-					RAISERROR('msdbCentral.dbo.backup_configuration does not exist, please run setup script', 0, 1) WITH NOWAIT;
-					RETURN;
-				
-				END;
-	
-	
-			WHILE @Backup = 1
-
-			/*
-			
-			Start loop to take log backups
-
-			*/
-
-			
-				BEGIN
-	
-					BEGIN TRY
-							
-							BEGIN TRAN;
-	
-								IF @Debug = 1 RAISERROR('Begin tran to grab a database to back up', 0, 1) WITH NOWAIT;
-
-
-								/*
-								
-								This grabs a database for a worker to work on
-
-								The locking hints hope to provide some isolation when 10+ workers are in action
-								
-								*/
-	
-							
-										SELECT TOP (1) 
-												@database = bw.database_name
-										FROM msdbCentral.dbo.backup_worker bw WITH (UPDLOCK, HOLDLOCK, ROWLOCK)
-										WHERE 
-											  (		/*This section works on databases already part of the backup cycle*/
-												    bw.is_started = 0
-												AND bw.is_completed = 1
-												AND bw.last_log_backup_start_time < DATEADD(SECOND, (@rpo * -1), GETDATE()) 
-                                                AND (bw.error_number IS NULL OR bw.error_number > 0) /* negative numbers indicate human attention required */
-												AND bw.ignore_database = 0
-											  )
-										OR    
-											  (		/*This section picks up newly added databases by Pollster*/
-											  	    bw.is_started = 0
-											  	AND bw.is_completed = 0
-											  	AND bw.last_log_backup_start_time = '1900-01-01 00:00:00.000'
-											  	AND bw.last_log_backup_finish_time = '9999-12-31 00:00:00.000'
-                                                AND (bw.error_number IS NULL OR bw.error_number > 0) /* negative numbers indicate human attention required */
-												AND bw.ignore_database = 0
-											  )
-										ORDER BY bw.last_log_backup_start_time ASC, bw.last_log_backup_finish_time ASC, bw.database_name ASC;
-	
-								
-									IF @database IS NOT NULL
-										BEGIN
-										SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database');
-										IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-								
-										/*
-								
-										Update the worker table so other workers know a database is being backed up
-								
-										*/
-
-								
-										UPDATE bw
-												SET bw.is_started = 1,
-													bw.is_completed = 0,
-													bw.last_log_backup_start_time = GETDATE()
-										FROM msdbCentral.dbo.backup_worker bw 
-										WHERE bw.database_name = @database;
-										END
-	
-							COMMIT;
-	
-					END TRY
-	
-					BEGIN CATCH
-						
-						/*
-						
-						Do I need to build retry logic in here? Try to catch deadlocks? I don't know yet!
-						
-						*/
-
-						SELECT @msg = N'Error securing a database to backup, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
-							   @error_severity = ERROR_SEVERITY(), 
-							   @error_state = ERROR_STATE();
-						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
-
-						SET @database = NULL;
-	
-						WHILE @@TRANCOUNT > 0
-							ROLLBACK;
-	
-					END CATCH;
-
-
-					/* If we don't find a database to work on, wait for a few seconds */
-					IF @database IS NULL
-
-						BEGIN
-							IF @Debug = 1 RAISERROR('No databases to back up right now, starting 3 second throttle', 0, 1) WITH NOWAIT;
-							WAITFOR DELAY '00:00:03.000';
-
-                            /* Check to make sure job is still enabled */
-		                    IF NOT EXISTS (
-						                    SELECT *
-						                    FROM msdb.dbo.sysjobs 
-						                    WHERE name LIKE 'sp_AllNightLog_Backup%'
-                                            AND enabled = 1
-						                    )
-                                BEGIN
-				                    RAISERROR('sp_AllNightLog_Backup jobs are disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
-				                    RETURN;
-                                END        
-
-
-						END
-	
-	
-					BEGIN TRY
-						
-						BEGIN
-	
-							IF @database IS NOT NULL
-
-							/*
-							
-							Make sure we have a database to work on -- I should make this more robust so we do something if it is NULL, maybe
-							
-							*/
-
-								
-								BEGIN
-	
-									SET @msg = N'Taking backup of ' + ISNULL(@database, 'UH OH NULL @database');
-									IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-
-										/*
-										
-										Call Ola's proc to backup the database
-										
-										*/
-
-	                                    IF @encrypt = 'Y'
-										    EXEC dbo.DatabaseBackup @Databases = @database, --Database we're working on
-																	       @BackupType = 'LOG', --Going for the LOGs
-																	       @Directory = @backup_path, --The path we need to back up to
-																	       @Verify = 'N', --We don't want to verify these, it eats into job time
-																	       @ChangeBackupType = @changebackuptype, --If we need to switch to a FULL because one hasn't been taken
-																	       @CheckSum = 'Y', --These are a good idea
-																	       @Compress = 'Y', --This is usually a good idea
-																	       @LogToTable = 'Y', --We should do this for posterity
-                                                                           @Encrypt = @encrypt,
-                                                                           @EncryptionAlgorithm = @encryptionalgorithm,
-                                                                           @ServerCertificate = @servercertificate;
-
-                                        ELSE
-									        EXEC dbo.DatabaseBackup @Databases = @database, --Database we're working on
-																	        @BackupType = 'LOG', --Going for the LOGs
-																	        @Directory = @backup_path, --The path we need to back up to
-																	        @Verify = 'N', --We don't want to verify these, it eats into job time
-																	        @ChangeBackupType = @changebackuptype, --If we need to switch to a FULL because one hasn't been taken
-																	        @CheckSum = 'Y', --These are a good idea
-																	        @Compress = 'Y', --This is usually a good idea
-																	        @LogToTable = 'Y'; --We should do this for posterity
-	
-										
-										/*
-										
-										Catch any erroneous zones
-										
-										*/
-										
-										SELECT @error_number = ERROR_NUMBER(), 
-											   @error_severity = ERROR_SEVERITY(), 
-											   @error_state = ERROR_STATE();
-	
-								END; --End call to dbo.DatabaseBackup
-	
-						END; --End successful check of @database (not NULL)
-					
-					END TRY
-	
-					BEGIN CATCH
-	
-						IF  @error_number IS NOT NULL
-
-						/*
-						
-						If the ERROR() function returns a number, update the table with it and the last error date.
-
-						Also update the last start time to 1900-01-01 so it gets picked back up immediately -- the query to find a log backup to take sorts by start time
-
-						*/
-	
-							BEGIN
-	
-								SET @msg = N'Error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()); 
-								RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
-								
-								SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for unsuccessful backup';
-								RAISERROR(@msg, 0, 1) WITH NOWAIT;
-	
-								
-									UPDATE bw
-											SET bw.is_started = 0,
-												bw.is_completed = 1,
-												bw.last_log_backup_start_time = '19000101',
-												bw.error_number = @error_number,
-												bw.last_error_date = GETDATE()
-									FROM msdbCentral.dbo.backup_worker bw 
-									WHERE bw.database_name = @database;
-
-
-								/*
-								
-								Set @database back to NULL to avoid variable assignment weirdness
-								
-								*/
-
-								SET @database = NULL;
-
-										
-										/*
-										
-										Wait around for a second so we're not just spinning wheels -- this only runs if the BEGIN CATCH is triggered by an error
-
-										*/
-										
-										IF @Debug = 1 RAISERROR('Starting 1 second throttle', 0, 1) WITH NOWAIT;
-										
-										WAITFOR DELAY '00:00:01.000';
-
-							END; -- End update of unsuccessful backup
-	
-					END CATCH;
-	
-					IF  @database IS NOT NULL AND @error_number IS NULL
-
-					/*
-						
-					If no error, update everything normally
-						
-					*/
-
-							
-						BEGIN
-	
-							IF @Debug = 1 RAISERROR('Error number IS NULL', 0, 1) WITH NOWAIT;
-								
-							SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for successful backup';
-							IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-	
-								
-								UPDATE bw
-										SET bw.is_started = 0,
-											bw.is_completed = 1,
-											bw.last_log_backup_finish_time = GETDATE()
-								FROM msdbCentral.dbo.backup_worker bw 
-								WHERE bw.database_name = @database;
-
-								
-							/*
-								
-							Set @database back to NULL to avoid variable assignment weirdness
-								
-							*/
-
-							SET @database = NULL;
-
-
-						END; -- End update for successful backup	
-
-										
-				END; -- End @Backup WHILE loop
-
-				
-		END; -- End successful check for backup_worker and subsequent code
-
-	
-	ELSE
-	
-		BEGIN
-	
-			RAISERROR('msdbCentral.dbo.backup_worker does not exist, please run setup script', 0, 1) WITH NOWAIT;
-			
-			RETURN;
-		
-		END;
-RETURN;
-
-
-/*
-
-Begin Restoregasm_Addict section
-
-*/
-
-Restoregasm_Addict:
-
-IF @Restore = 1
-	IF @Debug = 1 RAISERROR('Beginning Restores', 0, 1) WITH NOWAIT;
-	
-    /* Check to make sure backup jobs aren't enabled */
-	IF EXISTS (
-					SELECT *
-					FROM msdb.dbo.sysjobs 
-					WHERE name LIKE 'sp_AllNightLog_Backup%'
-                    AND enabled = 1
-					)
-        BEGIN
-			RAISERROR('sp_AllNightLog_Backup jobs are enabled, so gracefully exiting. You do not want to accidentally do restores over top of the databases you are backing up.', 0, 1) WITH NOWAIT;
-			RETURN;
-        END        
-
-	IF OBJECT_ID('msdb.dbo.restore_worker') IS NOT NULL
-	
-		BEGIN
-		
-			/*
-			
-			Make sure configuration table exists...
-			
-			*/
-	
-			IF OBJECT_ID('msdb.dbo.restore_configuration') IS NOT NULL
-	
-				BEGIN
-	
-					IF @Debug = 1 RAISERROR('Checking variables', 0, 1) WITH NOWAIT;
-		
-			/*
-			
-			These settings are configurable
-			
-			*/
-	
-						SELECT @rto  = CONVERT(INT, configuration_setting)
-						FROM msdb.dbo.restore_configuration c
-						WHERE configuration_name = N'log restore frequency';
-	
-							
-							IF @rto IS NULL
-								BEGIN
-									RAISERROR('@rto cannot be NULL. Please check the msdb.dbo.restore_configuration table', 0, 1) WITH NOWAIT;
-									RETURN;
-								END;	
-	
-		
-				END;
-	
-			ELSE
-	
-				BEGIN
-	
-					RAISERROR('msdb.dbo.restore_configuration does not exist, please run setup script', 0, 1) WITH NOWAIT;
-					
-					RETURN;
-				
-				END;
-	
-	
-			WHILE @Restore = 1
-
-			/*
-			
-			Start loop to restore log backups
-
-			*/
-
-			
-				BEGIN
-	
-					BEGIN TRY
-							
-							BEGIN TRAN;
-	
-								IF @Debug = 1 RAISERROR('Begin tran to grab a database to restore', 0, 1) WITH NOWAIT;
-
-
-								/*
-								
-								This grabs a database for a worker to work on
-
-								The locking hints hope to provide some isolation when 10+ workers are in action
-								
-								*/
-	
-							
-										SELECT TOP (1) 
-												@database = rw.database_name,
-												@only_logs_after = REPLACE(REPLACE(REPLACE(CONVERT(NVARCHAR(30), rw.last_log_restore_start_time, 120), ' ', ''), '-', ''), ':', ''),
-												@restore_full = CASE WHEN	  rw.is_started = 0
-																		  AND rw.is_completed = 0
-																		  AND rw.last_log_restore_start_time = '1900-01-01 00:00:00.000'
-																		  AND rw.last_log_restore_finish_time = '9999-12-31 00:00:00.000'
-																	THEN 1
-																	ELSE 0
-																END
-										FROM msdb.dbo.restore_worker rw WITH (UPDLOCK, HOLDLOCK, ROWLOCK)
-										WHERE 
-											  (		/*This section works on databases already part of the backup cycle*/
-												    rw.is_started = 0
-												AND rw.is_completed = 1
-												AND rw.last_log_restore_start_time < DATEADD(SECOND, (@rto * -1), GETDATE()) 
-                                                AND (rw.error_number IS NULL OR rw.error_number > 0) /* negative numbers indicate human attention required */
-											  )
-										OR    
-											  (		/*This section picks up newly added databases by DiskPollster*/
-											  	    rw.is_started = 0
-											  	AND rw.is_completed = 0
-											  	AND rw.last_log_restore_start_time = '1900-01-01 00:00:00.000'
-											  	AND rw.last_log_restore_finish_time = '9999-12-31 00:00:00.000'
-                                                AND (rw.error_number IS NULL OR rw.error_number > 0) /* negative numbers indicate human attention required */
-											  )
-										AND rw.ignore_database = 0
-										ORDER BY rw.last_log_restore_start_time ASC, rw.last_log_restore_finish_time ASC, rw.database_name ASC;
-	
-								
-									IF @database IS NOT NULL
-										BEGIN
-										SET @msg = N'Updating restore_worker for database ' + ISNULL(@database, 'UH OH NULL @database');
-										IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-								
-										/*
-								
-										Update the worker table so other workers know a database is being restored
-								
-										*/
-
-								
-										UPDATE rw
-												SET rw.is_started = 1,
-													rw.is_completed = 0,
-													rw.last_log_restore_start_time = GETDATE()
-										FROM msdb.dbo.restore_worker rw 
-										WHERE rw.database_name = @database;
-										END
-	
-							COMMIT;
-	
-					END TRY
-	
-					BEGIN CATCH
-						
-						/*
-						
-						Do I need to build retry logic in here? Try to catch deadlocks? I don't know yet!
-						
-						*/
-
-						SELECT @msg = N'Error securing a database to restore, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
-							   @error_severity = ERROR_SEVERITY(), 
-							   @error_state = ERROR_STATE();
-						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
-
-						SET @database = NULL;
-	
-						WHILE @@TRANCOUNT > 0
-							ROLLBACK;
-	
-					END CATCH;
-
-
-					/* If we don't find a database to work on, wait for a few seconds */
-					IF @database IS NULL
-
-						BEGIN
-							IF @Debug = 1 RAISERROR('No databases to restore up right now, starting 3 second throttle', 0, 1) WITH NOWAIT;
-							WAITFOR DELAY '00:00:03.000';
-
-                            /* Check to make sure backup jobs aren't enabled */
-	                        IF EXISTS (
-					                        SELECT *
-					                        FROM msdb.dbo.sysjobs 
-					                        WHERE name LIKE 'sp_AllNightLog_Backup%'
-                                            AND enabled = 1
-					                        )
-                                BEGIN
-			                        RAISERROR('sp_AllNightLog_Backup jobs are enabled, so gracefully exiting. You do not want to accidentally do restores over top of the databases you are backing up.', 0, 1) WITH NOWAIT;
-			                        RETURN;
-                                END        
-
-                            /* Check to make sure job is still enabled */
-		                    IF NOT EXISTS (
-						                    SELECT *
-						                    FROM msdb.dbo.sysjobs 
-						                    WHERE name LIKE 'sp_AllNightLog_Restore%'
-                                            AND enabled = 1
-						                    )
-                                BEGIN
-				                    RAISERROR('sp_AllNightLog_Restore jobs are disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
-				                    RETURN;
-                                END        
-
-						END
-	
-	
-					BEGIN TRY
-						
-						BEGIN
-	
-							IF @database IS NOT NULL
-
-							/*
-							
-							Make sure we have a database to work on -- I should make this more robust so we do something if it is NULL, maybe
-							
-							*/
-
-								
-								BEGIN
-	
-									SET @msg = CASE WHEN @restore_full = 0 
-														 THEN N'Restoring logs for ' 
-														 ELSE N'Restoring full backup for ' 
-													END 
-													+ ISNULL(@database, 'UH OH NULL @database');
-
-									IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-
-										/*
-										
-										Call sp_DatabaseRestore to backup the database
-										
-										*/
-
-										SET @restore_path_full = @restore_path_base + N'\' + @database + N'\' + N'FULL\'
-										
-											SET @msg = N'Path for FULL backups for ' + @database + N' is ' + @restore_path_full
-											IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-
-										SET @restore_path_log = @restore_path_base + N'\' + @database + N'\' + N'LOG\'
-
-											SET @msg = N'Path for LOG backups for ' + @database + N' is ' + @restore_path_log
-											IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-
-										IF @restore_full = 0
-
-											BEGIN
-
-												IF @Debug = 1 RAISERROR('Starting Log only restores', 0, 1) WITH NOWAIT;
-
-												EXEC dbo.sp_DatabaseRestore @Database = @database, 
-																				   @BackupPathFull = @restore_path_full,
-																				   @BackupPathLog = @restore_path_log,
-																				   @ContinueLogs = 1,
-																				   @RunRecovery = 0,
-																				   @OnlyLogsAfter = @only_logs_after,
-																				   @MoveFiles = @restore_move_files,
-																				   @Debug = @Debug
-	
-											END
-
-										IF @restore_full = 1
-
-											BEGIN
-
-												IF @Debug = 1 RAISERROR('Starting first Full restore from: ', 0, 1) WITH NOWAIT;
-												IF @Debug = 1 RAISERROR(@restore_path_full, 0, 1) WITH NOWAIT;
-
-												EXEC dbo.sp_DatabaseRestore @Database = @database, 
-																				   @BackupPathFull = @restore_path_full,
-																				   @BackupPathLog = @restore_path_log,
-																				   @ContinueLogs = 0,
-																				   @RunRecovery = 0,
-																				   @MoveFiles = @restore_move_files,
-																				   @Debug = @Debug
-	
-											END
-
-
-										
-										/*
-										
-										Catch any erroneous zones
-										
-										*/
-										
-										SELECT @error_number = ERROR_NUMBER(), 
-											   @error_severity = ERROR_SEVERITY(), 
-											   @error_state = ERROR_STATE();
-	
-								END; --End call to dbo.sp_DatabaseRestore
-	
-						END; --End successful check of @database (not NULL)
-					
-					END TRY
-	
-					BEGIN CATCH
-	
-						IF  @error_number IS NOT NULL
-
-						/*
-						
-						If the ERROR() function returns a number, update the table with it and the last error date.
-
-						Also update the last start time to 1900-01-01 so it gets picked back up immediately -- the query to find a log restore to take sorts by start time
-
-						*/
-	
-							BEGIN
-	
-								SET @msg = N'Error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()); 
-								RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
-								
-								SET @msg = N'Updating restore_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for unsuccessful backup';
-								RAISERROR(@msg, 0, 1) WITH NOWAIT;
-	
-								
-									UPDATE rw
-											SET rw.is_started = 0,
-												rw.is_completed = 1,
-												rw.last_log_restore_start_time = '19000101',
-												rw.error_number = @error_number,
-												rw.last_error_date = GETDATE()
-									FROM msdb.dbo.restore_worker rw 
-									WHERE rw.database_name = @database;
-
-
-								/*
-								
-								Set @database back to NULL to avoid variable assignment weirdness
-								
-								*/
-
-								SET @database = NULL;
-
-										
-										/*
-										
-										Wait around for a second so we're not just spinning wheels -- this only runs if the BEGIN CATCH is triggered by an error
-
-										*/
-										
-										IF @Debug = 1 RAISERROR('Starting 1 second throttle', 0, 1) WITH NOWAIT;
-										
-										WAITFOR DELAY '00:00:01.000';
-
-							END; -- End update of unsuccessful restore
-	
-					END CATCH;
-
-
-					IF  @database IS NOT NULL AND @error_number IS NULL
-
-					/*
-						
-					If no error, update everything normally
-						
-					*/
-
-							
-						BEGIN
-	
-							IF @Debug = 1 RAISERROR('Error number IS NULL', 0, 1) WITH NOWAIT;
-
-                            /* Make sure database actually exists and is in the restoring state */
-                            IF EXISTS (SELECT * FROM sys.databases WHERE name = @database AND state = 1) /* Restoring */
-								BEGIN
-							        SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for successful backup';
-							        IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-								
-								    UPDATE rw
-										    SET rw.is_started = 0,
-											    rw.is_completed = 1,
-											    rw.last_log_restore_finish_time = GETDATE()
-								    FROM msdb.dbo.restore_worker rw 
-								    WHERE rw.database_name = @database;
-
-                                END
-                            ELSE /* The database doesn't exist, or it's not in the restoring state */
-                                BEGIN
-							        SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for UNsuccessful backup';
-							        IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
-								
-								    UPDATE rw
-										    SET rw.is_started = 0,
-											    rw.is_completed = 1,
-                                                rw.error_number = -1, /* unknown, human attention required */
-                                                rw.last_error_date = GETDATE()
-											    /* rw.last_log_restore_finish_time = GETDATE()    don't change this - the last log may still be successful */
-								    FROM msdb.dbo.restore_worker rw 
-								    WHERE rw.database_name = @database;
-                                END
-
-
-								
-							/*
-								
-							Set @database back to NULL to avoid variable assignment weirdness
-								
-							*/
-
-							SET @database = NULL;
-
-
-						END; -- End update for successful backup	
-										
-				END; -- End @Restore WHILE loop
-
-				
-		END; -- End successful check for restore_worker and subsequent code
-
-	
-	ELSE
-	
-		BEGIN
-	
-			RAISERROR('msdb.dbo.restore_worker does not exist, please run setup script', 0, 1) WITH NOWAIT;
-			
-			RETURN;
-		
-		END;
-RETURN;
-
-
-
-END; -- Final END for stored proc
-
-GO 
-SET ANSI_NULLS ON;
-SET ANSI_PADDING ON;
-SET ANSI_WARNINGS ON;
-SET ARITHABORT ON;
-SET CONCAT_NULL_YIELDS_NULL ON;
-SET QUOTED_IDENTIFIER ON;
-SET STATISTICS IO OFF;
-SET STATISTICS TIME OFF;
-GO
-
 IF OBJECT_ID('dbo.sp_AllNightLog_Setup') IS NULL
   EXEC ('CREATE PROCEDURE dbo.sp_AllNightLog_Setup AS RETURN 0;');
 GO
@@ -1547,7 +38,7 @@ SET STATISTICS XML OFF;
 
 BEGIN;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -1628,7 +119,7 @@ BEGIN
 	
 	    MIT License
 		
-		Copyright (c) 2021 Brent Ozar Unlimited
+		Copyright (c) Brent Ozar Unlimited
 	
 		Permission is hereby granted, free of charge, to any person obtaining a copy
 		of this software and associated documentation files (the "Software"), to deal
@@ -2851,6 +1342,1524 @@ IF @UpdateSetup = 1
 END; -- Final END for stored proc
 GO
 
+SET ANSI_NULLS ON;
+SET ANSI_PADDING ON;
+SET ANSI_WARNINGS ON;
+SET ARITHABORT ON;
+SET CONCAT_NULL_YIELDS_NULL ON;
+SET QUOTED_IDENTIFIER ON;
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
+GO
+
+IF OBJECT_ID('dbo.sp_AllNightLog') IS NULL
+  EXEC ('CREATE PROCEDURE dbo.sp_AllNightLog AS RETURN 0;')
+GO
+
+
+ALTER PROCEDURE dbo.sp_AllNightLog
+								@PollForNewDatabases BIT = 0, /* Formerly Pollster */
+								@Backup BIT = 0, /* Formerly LogShaming */
+								@PollDiskForNewDatabases BIT = 0,
+								@Restore BIT = 0,
+								@Debug BIT = 0,
+								@Help BIT = 0,
+								@Version                 VARCHAR(30) = NULL OUTPUT,
+								@VersionDate             DATETIME = NULL OUTPUT,
+								@VersionCheckMode        BIT = 0
+WITH RECOMPILE
+AS
+SET NOCOUNT ON;
+SET STATISTICS XML OFF;
+
+BEGIN;
+
+
+SELECT @Version = '8.13', @VersionDate = '20230215';
+
+IF(@VersionCheckMode = 1)
+BEGIN
+	RETURN;
+END;
+
+IF @Help = 1
+
+BEGIN
+
+	PRINT '		
+		/*
+
+
+		sp_AllNightLog from http://FirstResponderKit.org
+		
+		* @PollForNewDatabases = 1 polls sys.databases for new entries
+			* Unfortunately no other way currently to automate new database additions when restored from backups
+				* No triggers or extended events that easily do this
+	
+		* @Backup = 1 polls msdbCentral.dbo.backup_worker for databases not backed up in [RPO], takes LOG backups
+			* Will switch to a full backup if none exists
+	
+	
+		To learn more, visit http://FirstResponderKit.org where you can download new
+		versions for free, watch training videos on how it works, get more info on
+		the findings, contribute your own code, and more.
+	
+		Known limitations of this version:
+		 - Only Microsoft-supported versions of SQL Server. Sorry, 2005 and 2000! And really, maybe not even anything less than 2016. Heh.
+         - When restoring encrypted backups, the encryption certificate must already be installed.
+	
+		Unknown limitations of this version:
+		 - None.  (If we knew them, they would be known. Duh.)
+	
+	     Changes - for the full list of improvements and fixes in this version, see:
+	     https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
+	
+	
+		Parameter explanations:
+	
+		  @PollForNewDatabases BIT, defaults to 0. When this is set to 1, runs in a perma-loop to find new entries in sys.databases 
+		  @Backup BIT, defaults to 0. When this is set to 1, runs in a perma-loop checking the backup_worker table for databases that need to be backed up
+		  @Debug BIT, defaults to 0. Whent this is set to 1, it prints out dynamic SQL commands
+		  @RPOSeconds BIGINT, defaults to 30. Value in seconds you want to use to determine if a new log backup needs to be taken.
+		  @BackupPath NVARCHAR(MAX), defaults to = ''D:\Backup''. You 99.99999% will need to change this path to something else. This tells Ola''s job where to put backups.
+	
+		For more documentation: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
+	
+	    MIT License
+		
+		Copyright (c) Brent Ozar Unlimited
+	
+		Permission is hereby granted, free of charge, to any person obtaining a copy
+		of this software and associated documentation files (the "Software"), to deal
+		in the Software without restriction, including without limitation the rights
+		to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+		copies of the Software, and to permit persons to whom the Software is
+		furnished to do so, subject to the following conditions:
+	
+		The above copyright notice and this permission notice shall be included in all
+		copies or substantial portions of the Software.
+	
+		THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+		IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+		FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+		AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+		LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+		OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+		SOFTWARE.
+
+
+		*/';
+
+RETURN
+END
+
+DECLARE	@database NVARCHAR(128) = NULL; --Holds the database that's currently being processed
+DECLARE @error_number INT = NULL; --Used for TRY/CATCH
+DECLARE @error_severity INT; --Used for TRY/CATCH
+DECLARE @error_state INT; --Used for TRY/CATCH
+DECLARE @msg NVARCHAR(4000) = N''; --Used for RAISERROR
+DECLARE @rpo INT; --Used to hold the RPO value in our configuration table
+DECLARE @rto INT; --Used to hold the RPO value in our configuration table
+DECLARE @backup_path NVARCHAR(MAX); --Used to hold the backup path in our configuration table
+DECLARE @changebackuptype NVARCHAR(MAX); --Config table: Y = escalate to full backup, MSDB = escalate if MSDB history doesn't show a recent full.
+DECLARE @encrypt NVARCHAR(MAX); --Config table: Y = encrypt the backup. N (default) = do not encrypt.
+DECLARE @encryptionalgorithm NVARCHAR(MAX); --Config table: native 2014 choices include TRIPLE_DES_3KEY, AES_128, AES_192, AES_256
+DECLARE @servercertificate NVARCHAR(MAX); --Config table: server certificate that is used to encrypt the backup
+DECLARE @restore_path_base NVARCHAR(MAX); --Used to hold the base backup path in our configuration table
+DECLARE @restore_path_full NVARCHAR(MAX); --Used to hold the full backup path in our configuration table
+DECLARE @restore_path_log NVARCHAR(MAX); --Used to hold the log backup path in our configuration table
+DECLARE @restore_move_files INT; -- used to hold the move files bit in our configuration table
+DECLARE @db_sql NVARCHAR(MAX) = N''; --Used to hold the dynamic SQL to create msdbCentral
+DECLARE @tbl_sql NVARCHAR(MAX) = N''; --Used to hold the dynamic SQL that creates tables in msdbCentral
+DECLARE @database_name NVARCHAR(256) = N'msdbCentral'; --Used to hold the name of the database we create to centralize data
+													   --Right now it's hardcoded to msdbCentral, but I made it dynamic in case that changes down the line
+DECLARE @cmd NVARCHAR(4000) = N'' --Holds dir cmd 
+DECLARE @FileList TABLE ( BackupFile NVARCHAR(255) ); --Where we dump @cmd
+DECLARE @restore_full BIT = 0 --We use this one
+DECLARE @only_logs_after NVARCHAR(30) = N''
+
+
+
+/*
+
+Make sure we're doing something
+
+*/
+
+IF (
+		  @PollForNewDatabases = 0
+	  AND @PollDiskForNewDatabases = 0
+	  AND @Backup = 0
+	  AND @Restore = 0
+	  AND @Help = 0
+)
+		BEGIN 		
+			RAISERROR('You don''t seem to have picked an action for this stored procedure to take.', 0, 1) WITH NOWAIT
+			
+			RETURN;
+		END 
+
+/*
+Make sure xp_cmdshell is enabled
+*/
+IF NOT EXISTS (SELECT * FROM sys.configurations WHERE name = 'xp_cmdshell' AND value_in_use = 1)
+		BEGIN 		
+			RAISERROR('xp_cmdshell must be enabled so we can get directory contents to check for new databases to restore.', 0, 1) WITH NOWAIT
+			
+			RETURN;
+		END 
+
+/*
+Make sure Ola Hallengren's scripts are installed in same database
+*/
+DECLARE @CurrentDatabaseContext nvarchar(128) = DB_NAME();
+IF NOT EXISTS (SELECT * FROM sys.procedures WHERE name = 'CommandExecute')
+		BEGIN 		
+			RAISERROR('Ola Hallengren''s CommandExecute must be installed in the same database (%s) as SQL Server First Responder Kit. More info: http://ola.hallengren.com', 0, 1, @CurrentDatabaseContext) WITH NOWAIT;
+			
+			RETURN;
+		END 
+IF NOT EXISTS (SELECT * FROM sys.procedures WHERE name = 'DatabaseBackup')
+		BEGIN 		
+			RAISERROR('Ola Hallengren''s DatabaseBackup must be installed in the same database (%s) as SQL Server First Responder Kit. More info: http://ola.hallengren.com', 0, 1, @CurrentDatabaseContext) WITH NOWAIT;
+			
+			RETURN;
+		END 
+
+/*
+Make sure sp_DatabaseRestore is installed in same database
+*/
+IF NOT EXISTS (SELECT * FROM sys.procedures WHERE name = 'sp_DatabaseRestore')
+		BEGIN 		
+			RAISERROR('sp_DatabaseRestore must be installed in the same database (%s) as SQL Server First Responder Kit. To get it: http://FirstResponderKit.org', 0, 1, @CurrentDatabaseContext) WITH NOWAIT;
+			
+			RETURN;
+		END 
+
+
+IF (@PollDiskForNewDatabases = 1 OR @Restore = 1) AND OBJECT_ID('msdb.dbo.restore_configuration') IS NOT NULL
+    BEGIN
+
+		IF @Debug = 1 RAISERROR('Checking restore path', 0, 1) WITH NOWAIT;
+
+		SELECT @restore_path_base = CONVERT(NVARCHAR(512), configuration_setting)
+		FROM msdb.dbo.restore_configuration c
+		WHERE configuration_name = N'log restore path';
+
+
+		IF @restore_path_base IS NULL
+			BEGIN
+				RAISERROR('@restore_path cannot be NULL. Please check the msdb.dbo.restore_configuration table', 0, 1) WITH NOWAIT;
+				RETURN;
+			END;
+
+        IF CHARINDEX('**', @restore_path_base) <> 0
+            BEGIN
+
+                /* If they passed in a dynamic **DATABASENAME**, stop at that folder looking for databases. More info: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/993 */
+                IF CHARINDEX('**DATABASENAME**', @restore_path_base) <> 0
+                    BEGIN
+                    SET @restore_path_base = SUBSTRING(@restore_path_base, 1, CHARINDEX('**DATABASENAME**',@restore_path_base) - 2);
+                    END;
+
+                SET @restore_path_base = REPLACE(@restore_path_base, '**AVAILABILITYGROUP**', '');
+                SET @restore_path_base = REPLACE(@restore_path_base, '**BACKUPTYPE**', 'FULL');
+                SET @restore_path_base = REPLACE(@restore_path_base, '**SERVERNAME**', REPLACE(CAST(SERVERPROPERTY('servername') AS nvarchar(max)),'\','$'));
+
+                IF CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max))) > 0
+                    BEGIN
+                        SET @restore_path_base = REPLACE(@restore_path_base, '**SERVERNAMEWITHOUTINSTANCE**', SUBSTRING(CAST(SERVERPROPERTY('servername') AS nvarchar(max)), 1, (CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max))) - 1)));
+                        SET @restore_path_base = REPLACE(@restore_path_base, '**INSTANCENAME**', SUBSTRING(CAST(SERVERPROPERTY('servername') AS nvarchar(max)), CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max))), (LEN(CAST(SERVERPROPERTY('servername') AS nvarchar(max))) - CHARINDEX('\',CAST(SERVERPROPERTY('servername') AS nvarchar(max)))) + 1));
+                    END
+                    ELSE /* No instance installed */
+                    BEGIN
+                        SET @restore_path_base = REPLACE(@restore_path_base, '**SERVERNAMEWITHOUTINSTANCE**', CAST(SERVERPROPERTY('servername') AS nvarchar(max)));
+                        SET @restore_path_base = REPLACE(@restore_path_base, '**INSTANCENAME**', 'DEFAULT');
+                    END
+
+                IF CHARINDEX('**CLUSTER**', @restore_path_base) <> 0
+                    BEGIN
+                    DECLARE @ClusterName NVARCHAR(128);
+                    IF EXISTS(SELECT * FROM sys.all_objects WHERE name = 'dm_hadr_cluster')
+                        BEGIN
+                            SELECT @ClusterName = cluster_name FROM sys.dm_hadr_cluster;
+                        END
+                    SET @restore_path_base = REPLACE(@restore_path_base, '**CLUSTER**', COALESCE(@ClusterName,''));
+                    END;
+
+            END /* IF CHARINDEX('**', @restore_path_base) <> 0 */
+		
+		SELECT @restore_move_files = CONVERT(BIT, configuration_setting)
+		FROM msdb.dbo.restore_configuration c
+		WHERE configuration_name = N'move files';
+		
+		IF @restore_move_files is NULL
+		BEGIN
+			-- Set to default value of 1
+			SET @restore_move_files = 1
+		END
+
+    END /* IF @PollDiskForNewDatabases = 1 OR @Restore = 1 */
+
+
+/*
+
+Certain variables necessarily skip to parts of this script that are irrelevant
+in both directions to each other. They are used for other stuff.
+
+*/
+
+
+/*
+
+Pollster use happens strictly to check for new databases in sys.databases to place them in a worker queue
+
+*/
+
+IF @PollForNewDatabases = 1
+	GOTO Pollster;
+
+/*
+
+LogShamer happens when we need to find and assign work to a worker job for backups
+
+*/
+
+IF @Backup = 1
+	GOTO LogShamer;
+
+/*
+
+Pollster use happens strictly to check for new databases in sys.databases to place them in a worker queue
+
+*/
+
+IF @PollDiskForNewDatabases = 1
+	GOTO DiskPollster;
+
+
+/*
+
+Restoregasm Addict happens when we need to find and assign work to a worker job for restores
+
+*/
+
+IF @Restore = 1
+	GOTO Restoregasm_Addict;
+
+
+
+/*
+
+Begin Polling section
+
+*/
+
+
+
+/*
+
+This section runs in a loop checking for new databases added to the server, or broken backups
+
+*/
+
+
+Pollster:
+
+	IF @Debug = 1 RAISERROR('Beginning Pollster', 0, 1) WITH NOWAIT;
+	
+	IF OBJECT_ID('msdbCentral.dbo.backup_worker') IS NOT NULL
+	
+		BEGIN
+		
+			WHILE @PollForNewDatabases = 1
+			
+			BEGIN
+				
+				BEGIN TRY
+			
+					IF @Debug = 1 RAISERROR('Checking for new databases...', 0, 1) WITH NOWAIT;
+
+					/*
+					
+					Look for new non-system databases -- there should probably be additional filters here for accessibility, etc.
+
+					*/
+	
+						INSERT msdbCentral.dbo.backup_worker (database_name) 
+						SELECT d.name
+						FROM sys.databases d
+						WHERE NOT EXISTS (
+							SELECT 1 
+							FROM msdbCentral.dbo.backup_worker bw
+							WHERE bw.database_name = d.name
+										)
+						AND d.database_id > 4;
+
+						IF @Debug = 1 RAISERROR('Checking for wayward databases', 0, 1) WITH NOWAIT;
+
+						/*
+							
+						This section aims to find databases that have
+							* Had a log backup ever (the default for finish time is 9999-12-31, so anything with a more recent finish time has had a log backup)
+							* Not had a log backup start in the last 5 minutes (this could be trouble! or a really big log backup)
+							* Also checks msdb.dbo.backupset to make sure the database has a full backup associated with it (otherwise it's the first full, and we don't need to start taking log backups yet)
+
+						*/
+	
+						IF EXISTS (
+								
+							SELECT 1
+							FROM msdbCentral.dbo.backup_worker bw WITH (READPAST)
+							WHERE bw.last_log_backup_finish_time < '99991231'
+							AND bw.last_log_backup_start_time < DATEADD(SECOND, (@rpo * -1), GETDATE())				
+							AND EXISTS (
+									SELECT 1
+									FROM msdb.dbo.backupset b
+									WHERE b.database_name = bw.database_name
+									AND b.type = 'D'
+										)								
+								)
+	
+							BEGIN
+									
+								IF @Debug = 1 RAISERROR('Resetting databases with a log backup and no log backup in the last 5 minutes', 0, 1) WITH NOWAIT;
+
+	
+									UPDATE bw
+											SET bw.is_started = 0,
+												bw.is_completed = 1,
+												bw.last_log_backup_start_time = '19000101'
+									FROM msdbCentral.dbo.backup_worker bw
+									WHERE bw.last_log_backup_finish_time < '99991231'
+									AND bw.last_log_backup_start_time < DATEADD(SECOND, (@rpo * -1), GETDATE())
+									AND EXISTS (
+											SELECT 1
+											FROM msdb.dbo.backupset b
+											WHERE b.database_name = bw.database_name
+											AND b.type = 'D'
+												);
+
+								
+								END; --End check for wayward databases
+
+						/*
+						
+						Wait 1 minute between runs, we don't need to be checking this constantly
+						
+						*/
+
+	
+					IF @Debug = 1 RAISERROR('Waiting for 1 minute', 0, 1) WITH NOWAIT;
+					
+					WAITFOR DELAY '00:01:00.000';
+
+				END TRY
+
+				BEGIN CATCH
+
+
+						SELECT @msg = N'Error inserting databases to msdbCentral.dbo.backup_worker, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
+							   @error_severity = ERROR_SEVERITY(), 
+							   @error_state = ERROR_STATE();
+						
+						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
+
+	
+						WHILE @@TRANCOUNT > 0
+							ROLLBACK;
+
+
+				END CATCH;
+	
+			
+			END; 
+
+        /* Check to make sure job is still enabled */
+		IF NOT EXISTS (
+						SELECT *
+						FROM msdb.dbo.sysjobs 
+						WHERE name = 'sp_AllNightLog_PollForNewDatabases'
+                        AND enabled = 1
+						)
+            BEGIN
+				RAISERROR('sp_AllNightLog_PollForNewDatabases job is disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
+				RETURN;
+            END        
+		
+		END;-- End Pollster loop
+	
+		ELSE
+	
+			BEGIN
+	
+				RAISERROR('msdbCentral.dbo.backup_worker does not exist, please create it.', 0, 1) WITH NOWAIT;
+				RETURN;
+			
+			END; 
+	RETURN;
+
+
+/*
+
+End of Pollster
+
+*/
+
+
+/*
+
+Begin DiskPollster
+
+*/
+
+
+/*
+
+This section runs in a loop checking restore path for new databases added to the server, or broken restores
+
+*/
+
+DiskPollster:
+
+	IF @Debug = 1 RAISERROR('Beginning DiskPollster', 0, 1) WITH NOWAIT;
+	
+	IF OBJECT_ID('msdb.dbo.restore_configuration') IS NOT NULL
+	
+		BEGIN
+		
+			WHILE @PollDiskForNewDatabases = 1
+			
+			BEGIN
+				
+				BEGIN TRY
+			
+					IF @Debug = 1 RAISERROR('Checking for new databases in: ', 0, 1) WITH NOWAIT;
+					IF @Debug = 1 RAISERROR(@restore_path_base, 0, 1) WITH NOWAIT;
+
+					/*
+					
+					Look for new non-system databases -- there should probably be additional filters here for accessibility, etc.
+
+					*/
+						
+						/*
+						
+						This setups up the @cmd variable to check the restore path for new folders
+						
+						In our case, a new folder means a new database, because we assume a pristine path
+
+						*/
+
+						SET @cmd = N'DIR /b "' + @restore_path_base + N'"';
+						
+									IF @Debug = 1
+									BEGIN
+										PRINT @cmd;
+									END  
+						
+						
+                        DELETE @FileList;
+						INSERT INTO @FileList (BackupFile)
+						EXEC master.sys.xp_cmdshell @cmd; 
+						
+						IF (
+							SELECT COUNT(*) 
+							FROM @FileList AS fl 
+							WHERE fl.BackupFile = 'The system cannot find the path specified.'
+							OR fl.BackupFile = 'File Not Found'
+							) = 1
+
+							BEGIN
+						
+								RAISERROR('No rows were returned for that database\path', 0, 1) WITH NOWAIT;
+
+							END;
+
+						IF (
+							SELECT COUNT(*) 
+							FROM @FileList AS fl 
+							WHERE fl.BackupFile = 'Access is denied.'
+							) = 1
+
+							BEGIN
+						
+								RAISERROR('Access is denied to %s', 16, 1, @restore_path_base) WITH NOWAIT;
+
+							END;
+
+						IF (
+							SELECT COUNT(*) 
+							FROM @FileList AS fl 
+							) = 1
+						AND (
+							SELECT COUNT(*) 
+							FROM @FileList AS fl 							
+							WHERE fl.BackupFile IS NULL
+							) = 1
+
+							BEGIN
+	
+								RAISERROR('That directory appears to be empty', 0, 1) WITH NOWAIT;
+	
+								RETURN;
+	
+							END
+
+						IF (
+							SELECT COUNT(*) 
+							FROM @FileList AS fl 
+							WHERE fl.BackupFile = 'The user name or password is incorrect.'
+							) = 1
+
+							BEGIN
+						
+								RAISERROR('Incorrect user name or password for %s', 16, 1, @restore_path_base) WITH NOWAIT;
+
+							END;
+
+						INSERT msdb.dbo.restore_worker (database_name) 
+						SELECT fl.BackupFile
+						FROM @FileList AS fl
+						WHERE fl.BackupFile IS NOT NULL
+						AND fl.BackupFile COLLATE DATABASE_DEFAULT NOT IN (SELECT name from sys.databases where database_id < 5)
+						AND NOT EXISTS
+							(
+							SELECT 1
+							FROM msdb.dbo.restore_worker rw
+							WHERE rw.database_name = fl.BackupFile
+							)
+
+						IF @Debug = 1 RAISERROR('Checking for wayward databases', 0, 1) WITH NOWAIT;
+
+						/*
+							
+						This section aims to find databases that have
+							* Had a log restore ever (the default for finish time is 9999-12-31, so anything with a more recent finish time has had a log restore)
+							* Not had a log restore start in the last 5 minutes (this could be trouble! or a really big log restore)
+							* Also checks msdb.dbo.backupset to make sure the database has a full backup associated with it (otherwise it's the first full, and we don't need to start adding log restores yet)
+
+						*/
+	
+						IF EXISTS (
+								
+							SELECT 1
+							FROM msdb.dbo.restore_worker rw WITH (READPAST)
+							WHERE rw.last_log_restore_finish_time < '99991231'
+							AND rw.last_log_restore_start_time < DATEADD(SECOND, (@rto * -1), GETDATE())			
+							AND EXISTS (
+									SELECT 1
+									FROM msdb.dbo.restorehistory r
+									WHERE r.destination_database_name = rw.database_name
+									AND r.restore_type = 'D'
+										)								
+								)
+	
+							BEGIN
+									
+								IF @Debug = 1 RAISERROR('Resetting databases with a log restore and no log restore in the last 5 minutes', 0, 1) WITH NOWAIT;
+
+	
+									UPDATE rw
+											SET rw.is_started = 0,
+												rw.is_completed = 1,
+												rw.last_log_restore_start_time = '19000101'
+									FROM msdb.dbo.restore_worker rw
+									WHERE rw.last_log_restore_finish_time < '99991231'
+									AND rw.last_log_restore_start_time < DATEADD(SECOND, (@rto * -1), GETDATE())
+									AND EXISTS (
+											SELECT 1
+											FROM msdb.dbo.restorehistory r
+											WHERE r.destination_database_name = rw.database_name
+											AND r.restore_type = 'D'
+												);
+
+								
+								END; --End check for wayward databases
+
+						/*
+						
+						Wait 1 minute between runs, we don't need to be checking this constantly
+						
+						*/
+
+                    /* Check to make sure job is still enabled */
+		            IF NOT EXISTS (
+						            SELECT *
+						            FROM msdb.dbo.sysjobs 
+						            WHERE name = 'sp_AllNightLog_PollDiskForNewDatabases'
+                                    AND enabled = 1
+						            )
+                        BEGIN
+				            RAISERROR('sp_AllNightLog_PollDiskForNewDatabases job is disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
+				            RETURN;
+                        END        
+	
+					IF @Debug = 1 RAISERROR('Waiting for 1 minute', 0, 1) WITH NOWAIT;
+					
+					WAITFOR DELAY '00:01:00.000';
+
+				END TRY
+
+				BEGIN CATCH
+
+
+						SELECT @msg = N'Error inserting databases to msdb.dbo.restore_worker, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
+							   @error_severity = ERROR_SEVERITY(), 
+							   @error_state = ERROR_STATE();
+						
+						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
+
+	
+						WHILE @@TRANCOUNT > 0
+							ROLLBACK;
+
+
+				END CATCH;
+	
+			
+			END; 
+		
+		END;-- End Pollster loop
+	
+		ELSE
+	
+			BEGIN
+	
+				RAISERROR('msdb.dbo.restore_worker does not exist, please create it.', 0, 1) WITH NOWAIT;
+				RETURN;
+			
+			END; 
+	RETURN;
+
+
+
+/*
+
+Begin LogShamer
+
+*/
+
+LogShamer:
+
+	IF @Debug = 1 RAISERROR('Beginning Backups', 0, 1) WITH NOWAIT;
+	
+	IF OBJECT_ID('msdbCentral.dbo.backup_worker') IS NOT NULL
+	
+		BEGIN
+		
+			/*
+			
+			Make sure configuration table exists...
+			
+			*/
+	
+			IF OBJECT_ID('msdbCentral.dbo.backup_configuration') IS NOT NULL
+	
+				BEGIN
+	
+					IF @Debug = 1 RAISERROR('Checking variables', 0, 1) WITH NOWAIT;
+		
+			/*
+			
+			These settings are configurable
+	
+			I haven't found a good way to find the default backup path that doesn't involve xp_regread
+			
+			*/
+	
+						SELECT @rpo  = CONVERT(INT, configuration_setting)
+						FROM msdbCentral.dbo.backup_configuration c
+						WHERE configuration_name = N'log backup frequency'
+                          AND database_name = N'all';
+	
+							
+							IF @rpo IS NULL
+								BEGIN
+									RAISERROR('@rpo cannot be NULL. Please check the msdbCentral.dbo.backup_configuration table', 0, 1) WITH NOWAIT;
+									RETURN;
+								END;	
+	
+	
+						SELECT @backup_path = CONVERT(NVARCHAR(512), configuration_setting)
+						FROM msdbCentral.dbo.backup_configuration c
+						WHERE configuration_name = N'log backup path'
+                          AND database_name = N'all';
+	
+							
+							IF @backup_path IS NULL
+								BEGIN
+									RAISERROR('@backup_path cannot be NULL. Please check the msdbCentral.dbo.backup_configuration table', 0, 1) WITH NOWAIT;
+									RETURN;
+								END;	
+
+						SELECT @changebackuptype = configuration_setting
+						FROM msdbCentral.dbo.backup_configuration c
+						WHERE configuration_name = N'change backup type'
+                          AND database_name = N'all';
+
+						SELECT @encrypt = configuration_setting
+						FROM msdbCentral.dbo.backup_configuration c
+						WHERE configuration_name = N'encrypt'
+                          AND database_name = N'all';
+
+						SELECT @encryptionalgorithm = configuration_setting
+						FROM msdbCentral.dbo.backup_configuration c
+						WHERE configuration_name = N'encryptionalgorithm'
+                          AND database_name = N'all';
+
+						SELECT @servercertificate = configuration_setting
+						FROM msdbCentral.dbo.backup_configuration c
+						WHERE configuration_name = N'servercertificate'
+                          AND database_name = N'all';
+
+							IF @encrypt = N'Y' AND (@encryptionalgorithm IS NULL OR @servercertificate IS NULL)
+								BEGIN
+									RAISERROR('If encryption is Y, then both the encryptionalgorithm and servercertificate must be set. Please check the msdbCentral.dbo.backup_configuration table', 0, 1) WITH NOWAIT;
+									RETURN;
+								END;	
+	
+				END;
+	
+			ELSE
+	
+				BEGIN
+	
+					RAISERROR('msdbCentral.dbo.backup_configuration does not exist, please run setup script', 0, 1) WITH NOWAIT;
+					RETURN;
+				
+				END;
+	
+	
+			WHILE @Backup = 1
+
+			/*
+			
+			Start loop to take log backups
+
+			*/
+
+			
+				BEGIN
+	
+					BEGIN TRY
+							
+							BEGIN TRAN;
+	
+								IF @Debug = 1 RAISERROR('Begin tran to grab a database to back up', 0, 1) WITH NOWAIT;
+
+
+								/*
+								
+								This grabs a database for a worker to work on
+
+								The locking hints hope to provide some isolation when 10+ workers are in action
+								
+								*/
+	
+							
+										SELECT TOP (1) 
+												@database = bw.database_name
+										FROM msdbCentral.dbo.backup_worker bw WITH (UPDLOCK, HOLDLOCK, ROWLOCK)
+										WHERE 
+											  (		/*This section works on databases already part of the backup cycle*/
+												    bw.is_started = 0
+												AND bw.is_completed = 1
+												AND bw.last_log_backup_start_time < DATEADD(SECOND, (@rpo * -1), GETDATE()) 
+                                                AND (bw.error_number IS NULL OR bw.error_number > 0) /* negative numbers indicate human attention required */
+												AND bw.ignore_database = 0
+											  )
+										OR    
+											  (		/*This section picks up newly added databases by Pollster*/
+											  	    bw.is_started = 0
+											  	AND bw.is_completed = 0
+											  	AND bw.last_log_backup_start_time = '1900-01-01 00:00:00.000'
+											  	AND bw.last_log_backup_finish_time = '9999-12-31 00:00:00.000'
+                                                AND (bw.error_number IS NULL OR bw.error_number > 0) /* negative numbers indicate human attention required */
+												AND bw.ignore_database = 0
+											  )
+										ORDER BY bw.last_log_backup_start_time ASC, bw.last_log_backup_finish_time ASC, bw.database_name ASC;
+	
+								
+									IF @database IS NOT NULL
+										BEGIN
+										SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database');
+										IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+								
+										/*
+								
+										Update the worker table so other workers know a database is being backed up
+								
+										*/
+
+								
+										UPDATE bw
+												SET bw.is_started = 1,
+													bw.is_completed = 0,
+													bw.last_log_backup_start_time = GETDATE()
+										FROM msdbCentral.dbo.backup_worker bw 
+										WHERE bw.database_name = @database;
+										END
+	
+							COMMIT;
+	
+					END TRY
+	
+					BEGIN CATCH
+						
+						/*
+						
+						Do I need to build retry logic in here? Try to catch deadlocks? I don't know yet!
+						
+						*/
+
+						SELECT @msg = N'Error securing a database to backup, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
+							   @error_severity = ERROR_SEVERITY(), 
+							   @error_state = ERROR_STATE();
+						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
+
+						SET @database = NULL;
+	
+						WHILE @@TRANCOUNT > 0
+							ROLLBACK;
+	
+					END CATCH;
+
+
+					/* If we don't find a database to work on, wait for a few seconds */
+					IF @database IS NULL
+
+						BEGIN
+							IF @Debug = 1 RAISERROR('No databases to back up right now, starting 3 second throttle', 0, 1) WITH NOWAIT;
+							WAITFOR DELAY '00:00:03.000';
+
+                            /* Check to make sure job is still enabled */
+		                    IF NOT EXISTS (
+						                    SELECT *
+						                    FROM msdb.dbo.sysjobs 
+						                    WHERE name LIKE 'sp_AllNightLog_Backup%'
+                                            AND enabled = 1
+						                    )
+                                BEGIN
+				                    RAISERROR('sp_AllNightLog_Backup jobs are disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
+				                    RETURN;
+                                END        
+
+
+						END
+	
+	
+					BEGIN TRY
+						
+						BEGIN
+	
+							IF @database IS NOT NULL
+
+							/*
+							
+							Make sure we have a database to work on -- I should make this more robust so we do something if it is NULL, maybe
+							
+							*/
+
+								
+								BEGIN
+	
+									SET @msg = N'Taking backup of ' + ISNULL(@database, 'UH OH NULL @database');
+									IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+
+										/*
+										
+										Call Ola's proc to backup the database
+										
+										*/
+
+	                                    IF @encrypt = 'Y'
+										    EXEC dbo.DatabaseBackup @Databases = @database, --Database we're working on
+																	       @BackupType = 'LOG', --Going for the LOGs
+																	       @Directory = @backup_path, --The path we need to back up to
+																	       @Verify = 'N', --We don't want to verify these, it eats into job time
+																	       @ChangeBackupType = @changebackuptype, --If we need to switch to a FULL because one hasn't been taken
+																	       @CheckSum = 'Y', --These are a good idea
+																	       @Compress = 'Y', --This is usually a good idea
+																	       @LogToTable = 'Y', --We should do this for posterity
+                                                                           @Encrypt = @encrypt,
+                                                                           @EncryptionAlgorithm = @encryptionalgorithm,
+                                                                           @ServerCertificate = @servercertificate;
+
+                                        ELSE
+									        EXEC dbo.DatabaseBackup @Databases = @database, --Database we're working on
+																	        @BackupType = 'LOG', --Going for the LOGs
+																	        @Directory = @backup_path, --The path we need to back up to
+																	        @Verify = 'N', --We don't want to verify these, it eats into job time
+																	        @ChangeBackupType = @changebackuptype, --If we need to switch to a FULL because one hasn't been taken
+																	        @CheckSum = 'Y', --These are a good idea
+																	        @Compress = 'Y', --This is usually a good idea
+																	        @LogToTable = 'Y'; --We should do this for posterity
+	
+										
+										/*
+										
+										Catch any erroneous zones
+										
+										*/
+										
+										SELECT @error_number = ERROR_NUMBER(), 
+											   @error_severity = ERROR_SEVERITY(), 
+											   @error_state = ERROR_STATE();
+	
+								END; --End call to dbo.DatabaseBackup
+	
+						END; --End successful check of @database (not NULL)
+					
+					END TRY
+	
+					BEGIN CATCH
+	
+						IF  @error_number IS NOT NULL
+
+						/*
+						
+						If the ERROR() function returns a number, update the table with it and the last error date.
+
+						Also update the last start time to 1900-01-01 so it gets picked back up immediately -- the query to find a log backup to take sorts by start time
+
+						*/
+	
+							BEGIN
+	
+								SET @msg = N'Error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()); 
+								RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
+								
+								SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for unsuccessful backup';
+								RAISERROR(@msg, 0, 1) WITH NOWAIT;
+	
+								
+									UPDATE bw
+											SET bw.is_started = 0,
+												bw.is_completed = 1,
+												bw.last_log_backup_start_time = '19000101',
+												bw.error_number = @error_number,
+												bw.last_error_date = GETDATE()
+									FROM msdbCentral.dbo.backup_worker bw 
+									WHERE bw.database_name = @database;
+
+
+								/*
+								
+								Set @database back to NULL to avoid variable assignment weirdness
+								
+								*/
+
+								SET @database = NULL;
+
+										
+										/*
+										
+										Wait around for a second so we're not just spinning wheels -- this only runs if the BEGIN CATCH is triggered by an error
+
+										*/
+										
+										IF @Debug = 1 RAISERROR('Starting 1 second throttle', 0, 1) WITH NOWAIT;
+										
+										WAITFOR DELAY '00:00:01.000';
+
+							END; -- End update of unsuccessful backup
+	
+					END CATCH;
+	
+					IF  @database IS NOT NULL AND @error_number IS NULL
+
+					/*
+						
+					If no error, update everything normally
+						
+					*/
+
+							
+						BEGIN
+	
+							IF @Debug = 1 RAISERROR('Error number IS NULL', 0, 1) WITH NOWAIT;
+								
+							SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for successful backup';
+							IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+	
+								
+								UPDATE bw
+										SET bw.is_started = 0,
+											bw.is_completed = 1,
+											bw.last_log_backup_finish_time = GETDATE()
+								FROM msdbCentral.dbo.backup_worker bw 
+								WHERE bw.database_name = @database;
+
+								
+							/*
+								
+							Set @database back to NULL to avoid variable assignment weirdness
+								
+							*/
+
+							SET @database = NULL;
+
+
+						END; -- End update for successful backup	
+
+										
+				END; -- End @Backup WHILE loop
+
+				
+		END; -- End successful check for backup_worker and subsequent code
+
+	
+	ELSE
+	
+		BEGIN
+	
+			RAISERROR('msdbCentral.dbo.backup_worker does not exist, please run setup script', 0, 1) WITH NOWAIT;
+			
+			RETURN;
+		
+		END;
+RETURN;
+
+
+/*
+
+Begin Restoregasm_Addict section
+
+*/
+
+Restoregasm_Addict:
+
+IF @Restore = 1
+	IF @Debug = 1 RAISERROR('Beginning Restores', 0, 1) WITH NOWAIT;
+	
+    /* Check to make sure backup jobs aren't enabled */
+	IF EXISTS (
+					SELECT *
+					FROM msdb.dbo.sysjobs 
+					WHERE name LIKE 'sp_AllNightLog_Backup%'
+                    AND enabled = 1
+					)
+        BEGIN
+			RAISERROR('sp_AllNightLog_Backup jobs are enabled, so gracefully exiting. You do not want to accidentally do restores over top of the databases you are backing up.', 0, 1) WITH NOWAIT;
+			RETURN;
+        END        
+
+	IF OBJECT_ID('msdb.dbo.restore_worker') IS NOT NULL
+	
+		BEGIN
+		
+			/*
+			
+			Make sure configuration table exists...
+			
+			*/
+	
+			IF OBJECT_ID('msdb.dbo.restore_configuration') IS NOT NULL
+	
+				BEGIN
+	
+					IF @Debug = 1 RAISERROR('Checking variables', 0, 1) WITH NOWAIT;
+		
+			/*
+			
+			These settings are configurable
+			
+			*/
+	
+						SELECT @rto  = CONVERT(INT, configuration_setting)
+						FROM msdb.dbo.restore_configuration c
+						WHERE configuration_name = N'log restore frequency';
+	
+							
+							IF @rto IS NULL
+								BEGIN
+									RAISERROR('@rto cannot be NULL. Please check the msdb.dbo.restore_configuration table', 0, 1) WITH NOWAIT;
+									RETURN;
+								END;	
+	
+		
+				END;
+	
+			ELSE
+	
+				BEGIN
+	
+					RAISERROR('msdb.dbo.restore_configuration does not exist, please run setup script', 0, 1) WITH NOWAIT;
+					
+					RETURN;
+				
+				END;
+	
+	
+			WHILE @Restore = 1
+
+			/*
+			
+			Start loop to restore log backups
+
+			*/
+
+			
+				BEGIN
+	
+					BEGIN TRY
+							
+							BEGIN TRAN;
+	
+								IF @Debug = 1 RAISERROR('Begin tran to grab a database to restore', 0, 1) WITH NOWAIT;
+
+
+								/*
+								
+								This grabs a database for a worker to work on
+
+								The locking hints hope to provide some isolation when 10+ workers are in action
+								
+								*/
+	
+							
+										SELECT TOP (1) 
+												@database = rw.database_name,
+												@only_logs_after = REPLACE(REPLACE(REPLACE(CONVERT(NVARCHAR(30), rw.last_log_restore_start_time, 120), ' ', ''), '-', ''), ':', ''),
+												@restore_full = CASE WHEN	  rw.is_started = 0
+																		  AND rw.is_completed = 0
+																		  AND rw.last_log_restore_start_time = '1900-01-01 00:00:00.000'
+																		  AND rw.last_log_restore_finish_time = '9999-12-31 00:00:00.000'
+																	THEN 1
+																	ELSE 0
+																END
+										FROM msdb.dbo.restore_worker rw WITH (UPDLOCK, HOLDLOCK, ROWLOCK)
+										WHERE (
+													(		/*This section works on databases already part of the backup cycle*/
+															rw.is_started = 0
+														AND rw.is_completed = 1
+														AND rw.last_log_restore_start_time < DATEADD(SECOND, (@rto * -1), GETDATE()) 
+														AND (rw.error_number IS NULL OR rw.error_number > 0) /* negative numbers indicate human attention required */
+													)
+												OR    
+													(		/*This section picks up newly added databases by DiskPollster*/
+															rw.is_started = 0
+														AND rw.is_completed = 0
+														AND rw.last_log_restore_start_time = '1900-01-01 00:00:00.000'
+														AND rw.last_log_restore_finish_time = '9999-12-31 00:00:00.000'
+														AND (rw.error_number IS NULL OR rw.error_number > 0) /* negative numbers indicate human attention required */
+													)
+											)
+										AND rw.ignore_database = 0										
+										AND NOT EXISTS	(
+															/* Validation check to ensure the database either doesn't exist or is in a restoring/standby state */
+															SELECT 1 
+															FROM sys.databases d
+															WHERE d.name = rw.database_name
+															AND state <> 1 /* Restoring */
+															AND NOT (state=0 AND d.is_in_standby=1) /* standby mode */
+														)
+										ORDER BY rw.last_log_restore_start_time ASC, rw.last_log_restore_finish_time ASC, rw.database_name ASC;
+	
+								
+									IF @database IS NOT NULL
+										BEGIN
+										SET @msg = N'Updating restore_worker for database ' + ISNULL(@database, 'UH OH NULL @database');
+										IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+								
+										/*
+								
+										Update the worker table so other workers know a database is being restored
+								
+										*/
+
+								
+										UPDATE rw
+												SET rw.is_started = 1,
+													rw.is_completed = 0,
+													rw.last_log_restore_start_time = GETDATE()
+										FROM msdb.dbo.restore_worker rw 
+										WHERE rw.database_name = @database;
+										END
+	
+							COMMIT;
+	
+					END TRY
+	
+					BEGIN CATCH
+						
+						/*
+						
+						Do I need to build retry logic in here? Try to catch deadlocks? I don't know yet!
+						
+						*/
+
+						SELECT @msg = N'Error securing a database to restore, error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()) + ', error message is ' + ERROR_MESSAGE(), 
+							   @error_severity = ERROR_SEVERITY(), 
+							   @error_state = ERROR_STATE();
+						RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
+
+						SET @database = NULL;
+	
+						WHILE @@TRANCOUNT > 0
+							ROLLBACK;
+	
+					END CATCH;
+
+
+					/* If we don't find a database to work on, wait for a few seconds */
+					IF @database IS NULL
+
+						BEGIN
+							IF @Debug = 1 RAISERROR('No databases to restore up right now, starting 3 second throttle', 0, 1) WITH NOWAIT;
+							WAITFOR DELAY '00:00:03.000';
+
+                            /* Check to make sure backup jobs aren't enabled */
+	                        IF EXISTS (
+					                        SELECT *
+					                        FROM msdb.dbo.sysjobs 
+					                        WHERE name LIKE 'sp_AllNightLog_Backup%'
+                                            AND enabled = 1
+					                        )
+                                BEGIN
+			                        RAISERROR('sp_AllNightLog_Backup jobs are enabled, so gracefully exiting. You do not want to accidentally do restores over top of the databases you are backing up.', 0, 1) WITH NOWAIT;
+			                        RETURN;
+                                END        
+
+                            /* Check to make sure job is still enabled */
+		                    IF NOT EXISTS (
+						                    SELECT *
+						                    FROM msdb.dbo.sysjobs 
+						                    WHERE name LIKE 'sp_AllNightLog_Restore%'
+                                            AND enabled = 1
+						                    )
+                                BEGIN
+				                    RAISERROR('sp_AllNightLog_Restore jobs are disabled, so gracefully exiting. It feels graceful to me, anyway.', 0, 1) WITH NOWAIT;
+				                    RETURN;
+                                END        
+
+						END
+	
+	
+					BEGIN TRY
+						
+						BEGIN
+	
+							IF @database IS NOT NULL
+
+							/*
+							
+							Make sure we have a database to work on -- I should make this more robust so we do something if it is NULL, maybe
+							
+							*/
+
+								
+								BEGIN
+	
+									SET @msg = CASE WHEN @restore_full = 0 
+														 THEN N'Restoring logs for ' 
+														 ELSE N'Restoring full backup for ' 
+													END 
+													+ ISNULL(@database, 'UH OH NULL @database');
+
+									IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+
+										/*
+										
+										Call sp_DatabaseRestore to backup the database
+										
+										*/
+
+										SET @restore_path_full = @restore_path_base + N'\' + @database + N'\' + N'FULL\'
+										
+											SET @msg = N'Path for FULL backups for ' + @database + N' is ' + @restore_path_full
+											IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+
+										SET @restore_path_log = @restore_path_base + N'\' + @database + N'\' + N'LOG\'
+
+											SET @msg = N'Path for LOG backups for ' + @database + N' is ' + @restore_path_log
+											IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+
+										IF @restore_full = 0
+
+											BEGIN
+
+												IF @Debug = 1 RAISERROR('Starting Log only restores', 0, 1) WITH NOWAIT;
+
+												EXEC dbo.sp_DatabaseRestore @Database = @database, 
+																				   @BackupPathFull = @restore_path_full,
+																				   @BackupPathLog = @restore_path_log,
+																				   @ContinueLogs = 1,
+																				   @RunRecovery = 0,
+																				   @OnlyLogsAfter = @only_logs_after,
+																				   @MoveFiles = @restore_move_files,
+																				   @Debug = @Debug
+	
+											END
+
+										IF @restore_full = 1
+
+											BEGIN
+
+												IF @Debug = 1 RAISERROR('Starting first Full restore from: ', 0, 1) WITH NOWAIT;
+												IF @Debug = 1 RAISERROR(@restore_path_full, 0, 1) WITH NOWAIT;
+
+												EXEC dbo.sp_DatabaseRestore @Database = @database, 
+																				   @BackupPathFull = @restore_path_full,
+																				   @BackupPathLog = @restore_path_log,
+																				   @ContinueLogs = 0,
+																				   @RunRecovery = 0,
+																				   @MoveFiles = @restore_move_files,
+																				   @Debug = @Debug
+	
+											END
+
+
+										
+										/*
+										
+										Catch any erroneous zones
+										
+										*/
+										
+										SELECT @error_number = ERROR_NUMBER(), 
+											   @error_severity = ERROR_SEVERITY(), 
+											   @error_state = ERROR_STATE();
+	
+								END; --End call to dbo.sp_DatabaseRestore
+	
+						END; --End successful check of @database (not NULL)
+					
+					END TRY
+	
+					BEGIN CATCH
+	
+						IF  @error_number IS NOT NULL
+
+						/*
+						
+						If the ERROR() function returns a number, update the table with it and the last error date.
+
+						Also update the last start time to 1900-01-01 so it gets picked back up immediately -- the query to find a log restore to take sorts by start time
+
+						*/
+	
+							BEGIN
+	
+								SET @msg = N'Error number is ' + CONVERT(NVARCHAR(10), ERROR_NUMBER()); 
+								RAISERROR(@msg, @error_severity, @error_state) WITH NOWAIT;
+								
+								SET @msg = N'Updating restore_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for unsuccessful backup';
+								RAISERROR(@msg, 0, 1) WITH NOWAIT;
+	
+								
+									UPDATE rw
+											SET rw.is_started = 0,
+												rw.is_completed = 1,
+												rw.last_log_restore_start_time = '19000101',
+												rw.error_number = @error_number,
+												rw.last_error_date = GETDATE()
+									FROM msdb.dbo.restore_worker rw 
+									WHERE rw.database_name = @database;
+
+
+								/*
+								
+								Set @database back to NULL to avoid variable assignment weirdness
+								
+								*/
+
+								SET @database = NULL;
+
+										
+										/*
+										
+										Wait around for a second so we're not just spinning wheels -- this only runs if the BEGIN CATCH is triggered by an error
+
+										*/
+										
+										IF @Debug = 1 RAISERROR('Starting 1 second throttle', 0, 1) WITH NOWAIT;
+										
+										WAITFOR DELAY '00:00:01.000';
+
+							END; -- End update of unsuccessful restore
+	
+					END CATCH;
+
+
+					IF  @database IS NOT NULL AND @error_number IS NULL
+
+					/*
+						
+					If no error, update everything normally
+						
+					*/
+
+							
+						BEGIN
+	
+							IF @Debug = 1 RAISERROR('Error number IS NULL', 0, 1) WITH NOWAIT;
+
+                            /* Make sure database actually exists and is in the restoring state */
+                            IF EXISTS (SELECT * FROM sys.databases WHERE name = @database AND state = 1) /* Restoring */
+								BEGIN
+							        SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for successful backup';
+							        IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+								
+								    UPDATE rw
+										    SET rw.is_started = 0,
+											    rw.is_completed = 1,
+											    rw.last_log_restore_finish_time = GETDATE()
+								    FROM msdb.dbo.restore_worker rw 
+								    WHERE rw.database_name = @database;
+
+                                END
+                            ELSE /* The database doesn't exist, or it's not in the restoring state */
+                                BEGIN
+							        SET @msg = N'Updating backup_worker for database ' + ISNULL(@database, 'UH OH NULL @database') + ' for UNsuccessful backup';
+							        IF @Debug = 1 RAISERROR(@msg, 0, 1) WITH NOWAIT;
+								
+								    UPDATE rw
+										    SET rw.is_started = 0,
+											    rw.is_completed = 1,
+                                                rw.error_number = -1, /* unknown, human attention required */
+                                                rw.last_error_date = GETDATE()
+											    /* rw.last_log_restore_finish_time = GETDATE()    don't change this - the last log may still be successful */
+								    FROM msdb.dbo.restore_worker rw 
+								    WHERE rw.database_name = @database;
+                                END
+
+
+								
+							/*
+								
+							Set @database back to NULL to avoid variable assignment weirdness
+								
+							*/
+
+							SET @database = NULL;
+
+
+						END; -- End update for successful backup	
+										
+				END; -- End @Restore WHILE loop
+
+				
+		END; -- End successful check for restore_worker and subsequent code
+
+	
+	ELSE
+	
+		BEGIN
+	
+			RAISERROR('msdb.dbo.restore_worker does not exist, please run setup script', 0, 1) WITH NOWAIT;
+			
+			RETURN;
+		
+		END;
+RETURN;
+
+
+
+END; -- Final END for stored proc
+
+GO 
 IF OBJECT_ID('dbo.sp_Blitz') IS NULL
   EXEC ('CREATE PROCEDURE dbo.sp_Blitz AS RETURN 0;');
 GO
@@ -2891,7 +2900,7 @@ AS
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
 
-	SELECT @Version = '8.11', @VersionDate = '20221013';
+	SELECT @Version = '8.13', @VersionDate = '20230215';
 	SET @OutputType = UPPER(@OutputType);
 
     IF(@VersionCheckMode = 1)
@@ -2946,9 +2955,9 @@ AS
 	tigertoolbox and are provided under the MIT license:
 	https://github.com/Microsoft/tigertoolbox
 	
-	All other copyrights for sp_Blitz are held by Brent Ozar Unlimited, 2021.
+	All other copyrights for sp_Blitz are held by Brent Ozar Unlimited.
 
-	Copyright (c) 2021 Brent Ozar Unlimited
+	Copyright (c) Brent Ozar Unlimited
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -3943,7 +3952,7 @@ AS
 												)
 												OR
 												(
-													Convert(datetime,ll.Value) < DATEADD(dd,-7, GETDATE())
+													Convert(datetime,ll.Value,21) < DATEADD(dd,-7, GETDATE())
 												)
 
 											);
@@ -12590,7 +12599,7 @@ AS
 SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -13468,7 +13477,7 @@ AS
 	SET STATISTICS XML OFF;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
-	SELECT @Version = '8.11', @VersionDate = '20221013';
+	SELECT @Version = '8.13', @VersionDate = '20230215';
 	
 	IF(@VersionCheckMode = 1)
 	BEGIN
@@ -13515,7 +13524,7 @@ AS
 
     MIT License
 	
-	Copyright (c) 2021 Brent Ozar Unlimited
+	Copyright (c) Brent Ozar Unlimited
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -15202,7 +15211,8 @@ CREATE TABLE ##BlitzCacheProcs (
 		cached_execution_parameters XML,
 		missing_indexes XML,
         SetOptions VARCHAR(MAX),
-        Warnings VARCHAR(MAX)
+        Warnings VARCHAR(MAX),
+    	Pattern NVARCHAR(20)
     );
 GO 
 
@@ -15249,7 +15259,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 SET @OutputType = UPPER(@OutputType);
 
 IF(@VersionCheckMode = 1)
@@ -15273,7 +15283,6 @@ IF @Help = 1
 	the findings, contribute your own code, and more.
 
 	Known limitations of this version:
-	 - This query will not run on SQL Server 2005.
 	 - SQL Server 2008 and 2008R2 have a bug in trigger stats, so that output is
 	   excluded by default.
 	 - @IgnoreQueryHashes and @OnlyQueryHashes require a CSV list of hashes
@@ -15289,7 +15298,7 @@ IF @Help = 1
 
 	MIT License
 
-	Copyright (c) 2021 Brent Ozar Unlimited
+	Copyright (c) Brent Ozar Unlimited
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -16025,7 +16034,8 @@ BEGIN
 		cached_execution_parameters XML,
 		missing_indexes XML,
         SetOptions VARCHAR(MAX),
-        Warnings VARCHAR(MAX)
+        Warnings VARCHAR(MAX),
+		Pattern NVARCHAR(20)
     );
 END;
 
@@ -16126,18 +16136,18 @@ IF @SkipAnalysis = 1
 
 DECLARE @AllSortSql NVARCHAR(MAX) = N'';
 DECLARE @VersionShowsMemoryGrants BIT;
-IF EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_grant_kb')
+IF EXISTS(SELECT * FROM sys.all_columns WHERE object_id = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_grant_kb')
     SET @VersionShowsMemoryGrants = 1;
 ELSE
     SET @VersionShowsMemoryGrants = 0;
 
 DECLARE @VersionShowsSpills BIT;
-IF EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_spills')
+IF EXISTS(SELECT * FROM sys.all_columns WHERE object_id = OBJECT_ID('sys.dm_exec_query_stats') AND name = 'max_spills')
     SET @VersionShowsSpills = 1;
 ELSE
     SET @VersionShowsSpills = 0;
 
-IF EXISTS(SELECT * FROM sys.all_columns WHERE OBJECT_ID = OBJECT_ID('sys.dm_exec_query_plan_stats') AND name = 'query_plan')
+IF EXISTS(SELECT * FROM sys.all_columns WHERE object_id = OBJECT_ID('sys.dm_exec_query_plan_stats') AND name = 'query_plan')
     SET @VersionShowsAirQuoteActualPlans = 1;
 ELSE
     SET @VersionShowsAirQuoteActualPlans = 0;
@@ -16944,7 +16954,7 @@ INSERT INTO ##BlitzCacheProcs (SPID, QueryType, DatabaseName, AverageCPU, TotalC
                     LastReturnedRows, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, 
 					QueryText, QueryPlan, TotalWorkerTimeForType, TotalElapsedTimeForType, TotalReadsForType,
                     TotalExecutionCountForType, TotalWritesForType, SqlHandle, PlanHandle, QueryHash, QueryPlanHash,
-                    min_worker_time, max_worker_time, is_parallel, min_elapsed_time, max_elapsed_time, age_minutes, age_minutes_lifetime) ' ;
+                    min_worker_time, max_worker_time, is_parallel, min_elapsed_time, max_elapsed_time, age_minutes, age_minutes_lifetime, Pattern) ' ;
 
 SET @body += N'
 FROM   (SELECT TOP (@Top) x.*, xpa.*,
@@ -17208,7 +17218,8 @@ SELECT TOP (@Top)
        qs.min_elapsed_time / 1000.0,
        qs.max_elapsed_time / 1000.0,
        age_minutes, 
-       age_minutes_lifetime ';
+       age_minutes_lifetime,
+       @SortOrder ';
 
 
 IF LEFT(@QueryFilter, 3) IN ('all', 'sta')
@@ -17356,7 +17367,8 @@ BEGIN
            qs.min_elapsed_time / 1000.0,
            qs.max_worker_time  / 1000.0,
            age_minutes,
-           age_minutes_lifetime ';
+           age_minutes_lifetime,
+    	   @SortOrder ';
     
     SET @sql += REPLACE(REPLACE(@body, '#view#', 'dm_exec_query_stats'), 'cached_time', 'creation_time') ;
 
@@ -17591,7 +17603,7 @@ IF @Reanalyze = 0
 BEGIN
     RAISERROR('Collecting execution plan information.', 0, 1) WITH NOWAIT;
 
-    EXEC sp_executesql @sql, N'@Top INT, @min_duration INT, @min_back INT', @Top, @DurationFilter_i, @MinutesBack;
+    EXEC sp_executesql @sql, N'@Top INT, @min_duration INT, @min_back INT, @SortOrder NVARCHAR(20)', @Top, @DurationFilter_i, @MinutesBack, @SortOrder;
 END;
 
 IF @SkipAnalysis = 1
@@ -18720,6 +18732,35 @@ FROM    ##BlitzCacheProcs p
         JOIN sys.dm_exec_procedure_stats s ON p.SqlHandle = s.sql_handle
 WHERE   QueryType = 'Statement'
 AND SPID = @@SPID
+OPTION (RECOMPILE);
+
+/* Update to grab stored procedure name for individual statements when PSPO is detected */
+UPDATE  p
+SET     QueryType = QueryType + ' (parent ' +
+                    + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id, s.database_id))
+                    + '.'
+                    + QUOTENAME(OBJECT_NAME(s.object_id, s.database_id)) + ')'
+FROM    ##BlitzCacheProcs p
+		OUTER APPLY (
+				SELECT	REPLACE(REPLACE(REPLACE(REPLACE(p.QueryText, ' (', '('), '( ', '('), ' =', '='), '= ', '=') AS NormalizedQueryText
+				) a
+		OUTER APPLY (
+				SELECT	CHARINDEX('option(PLAN PER VALUE(ObjectID=', a.NormalizedQueryText) AS OptionStart
+				) b
+		OUTER APPLY (
+				SELECT	SUBSTRING(a.NormalizedQueryText, b.OptionStart + 31, LEN(a.NormalizedQueryText) - b.OptionStart - 30) AS OptionSubstring
+				WHERE	b.OptionStart > 0
+				) c
+		OUTER APPLY (
+				SELECT  PATINDEX('%[^0-9]%', c.OptionSubstring) AS ObjectLength
+				) d
+		OUTER APPLY (
+				SELECT	TRY_CAST(SUBSTRING(OptionSubstring, 1, d.ObjectLength - 1) AS INT) AS ObjectId
+				) e
+		JOIN    sys.dm_exec_procedure_stats s ON DB_ID(p.DatabaseName) = s.database_id AND e.ObjectId = s.object_id
+WHERE   p.QueryType = 'Statement'
+AND		p.SPID = @@SPID
+AND		s.object_id IS NOT NULL
 OPTION (RECOMPILE);
 
 RAISERROR(N'Attempting to get function name for individual statements', 0, 1) WITH NOWAIT;
@@ -22055,6 +22096,7 @@ ELSE
 					TotalSpills BIGINT,
 					AvgSpills MONEY,
 					QueryPlanCost FLOAT,
+					Pattern NVARCHAR(20),
 					JoinKey AS ServerName + Cast(CheckDate AS NVARCHAR(50)),
 					CONSTRAINT [PK_' + REPLACE(REPLACE(@OutputTableName,N'[',N''),N']',N'') + N'] PRIMARY KEY CLUSTERED(ID ASC));'
 				  );
@@ -22156,6 +22198,22 @@ END ';
                     EXEC(@StringToExecute);
                 END;
             
+			/* If the table doesn't have the new Pattern column, add it */
+            SET @ObjectFullName = @OutputDatabaseName + N'.' + @OutputSchemaName + N'.' +  @OutputTableName;
+            SET @StringToExecute = N'IF NOT EXISTS (SELECT * FROM ' + @OutputDatabaseName + N'.sys.all_columns 
+                WHERE object_id = (OBJECT_ID(''' + @ObjectFullName + N''')) AND name = ''Pattern'')
+                ALTER TABLE ' + @ObjectFullName + N' ADD Pattern NVARCHAR(20) NULL;';
+			IF @ValidOutputServer = 1
+				BEGIN
+					SET @StringToExecute = REPLACE(@StringToExecute,'''Pattern''','''''Pattern''''');
+					SET @StringToExecute = REPLACE(@StringToExecute,'''' + @ObjectFullName + '''','''''' + @ObjectFullName + '''''');
+                    EXEC('EXEC('''+@StringToExecute+''') AT ' + @OutputServerName);
+                END;
+            ELSE
+                BEGIN
+                    EXEC(@StringToExecute);
+                END            
+            
             IF @CheckDateOverride IS NULL
                 BEGIN
                     SET @CheckDateOverride = SYSDATETIMEOFFSET();
@@ -22175,14 +22233,14 @@ END ';
 					+ ' (ServerName, CheckDate, Version, QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, CPUWeight, AverageDuration, TotalDuration, DurationWeight, PercentDurationByType, AverageReads, TotalReads, ReadWeight, PercentReadsByType, '
                     + ' AverageWrites, TotalWrites, WriteWeight, PercentWritesByType, ExecutionCount, ExecutionWeight, PercentExecutionsByType, '
                     + ' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, LastCompletionTime, PlanHandle, SqlHandle, QueryHash, QueryPlanHash, StatementStartOffset, StatementEndOffset, PlanGenerationNum, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
-                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost ) '
+                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost, Pattern ) '
                     + 'SELECT TOP (@Top) '
                     + QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)), '''') + ', @CheckDateOverride, '
                     + QUOTENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), '''') + ', '
                     + ' QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, PercentCPU, AverageDuration, TotalDuration, PercentDuration, PercentDurationByType, AverageReads, TotalReads, PercentReads, PercentReadsByType, '
                     + ' AverageWrites, TotalWrites, PercentWrites, PercentWritesByType, ExecutionCount, PercentExecutions, PercentExecutionsByType, '
                     + ' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, LastCompletionTime, PlanHandle, SqlHandle, QueryHash, QueryPlanHash, StatementStartOffset, StatementEndOffset, PlanGenerationNum, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, CAST(QueryPlan AS NVARCHAR(MAX)), NumberOfPlans, NumberOfDistinctPlans, Warnings, '
-                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost '
+                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost, Pattern '
                     + ' FROM ##BlitzCacheProcs '
                     + ' WHERE 1=1 ';
 
@@ -22209,7 +22267,9 @@ END ';
                                                                     WHEN N'avg duration' THEN N' AverageDuration'
                                                                     WHEN N'avg executions' THEN N' ExecutionsPerMinute'
                                                                     WHEN N'avg memory grant' THEN N' AvgMaxMemoryGrant'
-                                                                    WHEN 'avg spills' THEN N' AvgSpills'
+                                                                    WHEN N'avg spills' THEN N' AvgSpills'
+                                                                    WHEN N'unused grant' THEN N' MaxGrantKB - MaxUsedGrantKB'
+																	ELSE N' TotalCPU '
                                                                     END + N' DESC ';
                     SET @StringToExecute += N' OPTION (RECOMPILE) ; ';    
                     
@@ -22241,14 +22301,14 @@ END ';
 					+ ' (ServerName, CheckDate, Version, QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, CPUWeight, AverageDuration, TotalDuration, DurationWeight, PercentDurationByType, AverageReads, TotalReads, ReadWeight, PercentReadsByType, '
                     + ' AverageWrites, TotalWrites, WriteWeight, PercentWritesByType, ExecutionCount, ExecutionWeight, PercentExecutionsByType, '
                     + ' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, LastCompletionTime, PlanHandle, SqlHandle, QueryHash, QueryPlanHash, StatementStartOffset, StatementEndOffset, PlanGenerationNum, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
-                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost ) '
+                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost, Pattern ) '
                     + 'SELECT TOP (@Top) '
                     + QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)), '''') + ', @CheckDateOverride, '
                     + QUOTENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), '''') + ', '
                     + ' QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, PercentCPU, AverageDuration, TotalDuration, PercentDuration, PercentDurationByType, AverageReads, TotalReads, PercentReads, PercentReadsByType, '
                     + ' AverageWrites, TotalWrites, PercentWrites, PercentWritesByType, ExecutionCount, PercentExecutions, PercentExecutionsByType, '
                     + ' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, LastCompletionTime, PlanHandle, SqlHandle, QueryHash, QueryPlanHash, StatementStartOffset, StatementEndOffset, PlanGenerationNum, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
-                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost '
+                    + ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost, Pattern '
                     + ' FROM ##BlitzCacheProcs '
                     + ' WHERE 1=1 ';
 
@@ -22275,7 +22335,9 @@ END ';
                                                                     WHEN N'avg duration' THEN N' AverageDuration'
                                                                     WHEN N'avg executions' THEN N' ExecutionsPerMinute'
                                                                     WHEN N'avg memory grant' THEN N' AvgMaxMemoryGrant'
-                                                                    WHEN 'avg spills' THEN N' AvgSpills'
+                                                                    WHEN N'avg spills' THEN N' AvgSpills'
+                                                                    WHEN N'unused grant' THEN N' MaxGrantKB - MaxUsedGrantKB'
+																	ELSE N' TotalCPU '
                                                                     END + N' DESC ';
                     SET @StringToExecute += N' OPTION (RECOMPILE) ; ';    
                     
@@ -22388,6 +22450,7 @@ END ';
 						TotalSpills BIGINT,
 						AvgSpills MONEY,
 						QueryPlanCost FLOAT,
+						Pattern NVARCHAR(20),                    
 						JoinKey AS ServerName + Cast(CheckDate AS NVARCHAR(50)),
 						CONSTRAINT [PK_' + REPLACE(REPLACE(@OutputTableName,'[',''),']','') + '] PRIMARY KEY CLUSTERED(ID ASC));';
 					SET @StringToExecute +=	N' INSERT '
@@ -22395,14 +22458,14 @@ END ';
 						+ ' (ServerName, CheckDate, Version, QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, CPUWeight, AverageDuration, TotalDuration, DurationWeight, PercentDurationByType, AverageReads, TotalReads, ReadWeight, PercentReadsByType, '
 						+ ' AverageWrites, TotalWrites, WriteWeight, PercentWritesByType, ExecutionCount, ExecutionWeight, PercentExecutionsByType, '
 						+ ' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, LastCompletionTime, PlanHandle, SqlHandle, QueryHash, QueryPlanHash, StatementStartOffset, StatementEndOffset, PlanGenerationNum, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
-						+ ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost ) '
+						+ ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost, Pattern ) '
 						+ 'SELECT TOP (@Top) '
 						+ QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)), '''') + ', @CheckDateOverride, '
 						+ QUOTENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), '''') + ', '
 						+ ' QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, PercentCPU, AverageDuration, TotalDuration, PercentDuration, PercentDurationByType, AverageReads, TotalReads, PercentReads, PercentReadsByType, '
 						+ ' AverageWrites, TotalWrites, PercentWrites, PercentWritesByType, ExecutionCount, PercentExecutions, PercentExecutionsByType, '
 						+ ' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, LastCompletionTime, PlanHandle, SqlHandle, QueryHash, QueryPlanHash, StatementStartOffset, StatementEndOffset, PlanGenerationNum, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
-						+ ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost '
+						+ ' SerialRequiredMemory, SerialDesiredMemory, MinGrantKB, MaxGrantKB, MinUsedGrantKB, MaxUsedGrantKB, PercentMemoryGrantUsed, AvgMaxMemoryGrant, MinSpills, MaxSpills, TotalSpills, AvgSpills, QueryPlanCost, Pattern '
 						+ ' FROM ##BlitzCacheProcs '
 						+ ' WHERE 1=1 ';
                         
@@ -22432,7 +22495,9 @@ END ';
                                                                         WHEN N'avg duration' THEN N' AverageDuration'
                                                                         WHEN N'avg executions' THEN N' ExecutionsPerMinute'
                                                                         WHEN N'avg memory grant' THEN N' AvgMaxMemoryGrant'
-                                                                        WHEN 'avg spills' THEN N' AvgSpills'
+																		WHEN N'avg spills' THEN N' AvgSpills'
+																		WHEN N'unused grant' THEN N' MaxGrantKB - MaxUsedGrantKB'
+																		ELSE N' TotalCPU '
                                                                         END + N' DESC ';
 
                         SET @StringToExecute += N' OPTION (RECOMPILE) ; ';    
@@ -22512,7 +22577,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 SET @OutputType  = UPPER(@OutputType);
 
 IF(@VersionCheckMode = 1)
@@ -22549,7 +22614,7 @@ Unknown limitations of this version:
 
 MIT License
 
-Copyright (c) 2021 Brent Ozar Unlimited
+Copyright (c) Brent Ozar Unlimited
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22623,25 +22688,41 @@ SELECT
 		END;
 
 RAISERROR(N'Starting run. %s', 0,1, @ScriptVersionName) WITH NOWAIT;
-																					
+
+																				
 IF(@OutputType NOT IN ('TABLE','NONE'))
 BEGIN
     RAISERROR('Invalid value for parameter @OutputType. Expected: (TABLE;NONE)',12,1);
     RETURN;
 END;
+
+IF(@OutputType = 'TABLE' AND NOT (@OutputTableName IS NULL AND @OutputSchemaName IS NULL AND @OutputDatabaseName IS NULL AND @OutputServerName IS NULL))
+BEGIN
+	RAISERROR(N'One or more output parameters specified in combination with TABLE output, changing to NONE output mode', 0,1) WITH NOWAIT;
+	SET @OutputType = 'NONE'
+END;
                        
 IF(@OutputType = 'NONE')
 BEGIN
+
+	IF ((@OutputServerName IS NOT NULL) AND (@OutputTableName IS NULL OR @OutputSchemaName IS NULL OR @OutputDatabaseName IS NULL))
+	BEGIN
+        RAISERROR('Parameter @OutputServerName is specified, rest of @Output* parameters needs to also be specified',12,1);
+        RETURN;
+	END;
+
     IF(@OutputTableName IS NULL OR @OutputSchemaName IS NULL OR @OutputDatabaseName IS NULL)
     BEGIN
-        RAISERROR('This procedure should be called with a value for @Output* parameters, as @OutputType is set to NONE',12,1);
+        RAISERROR('This procedure should be called with a value for @OutputTableName, @OutputSchemaName and @OutputDatabaseName parameters, as @OutputType is set to NONE',12,1);
         RETURN;
     END;
+	/* Output is supported for all modes, no reason to not bring pain and output
     IF(@BringThePain = 1)
     BEGIN
         RAISERROR('Incompatible Parameters: @BringThePain set to 1 and @OutputType set to NONE',12,1);
         RETURN;
     END;
+	*/
 	/* Eventually limit by mode																			   
     IF(@Mode not in (0,4)) 
 	BEGIN
@@ -24389,7 +24470,7 @@ BEGIN TRY
 		OR   (PARSENAME(@SQLServerProductVersion, 4) = 10 AND PARSENAME(@SQLServerProductVersion, 3) = 50 AND PARSENAME(@SQLServerProductVersion, 2) >= 2500))
 		BEGIN
 		RAISERROR (N'Gathering Statistics Info With Newer Syntax.',0,1) WITH NOWAIT;
-		SET @dsql=N'USE ' + @DatabaseName + N'; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+		SET @dsql=N'USE ' + QUOTENAME(@DatabaseName) + N'; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 			INSERT #Statistics ( database_id, database_name, table_name, schema_name, index_name, column_names, statistics_name, last_statistics_update, 
 								days_since_last_stats_update, rows, rows_sampled, percent_sampled, histogram_steps, modification_counter, 
 								percent_modifications, modifications_before_auto_update, index_type_desc, table_create_date, table_modify_date,
@@ -24464,7 +24545,7 @@ BEGIN TRY
 			ELSE 
 			BEGIN
 			RAISERROR (N'Gathering Statistics Info With Older Syntax.',0,1) WITH NOWAIT;
-			SET @dsql=N'USE ' + @DatabaseName + N'; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+			SET @dsql=N'USE ' + QUOTENAME(@DatabaseName) + N'; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 			INSERT #Statistics(database_id, database_name, table_name, schema_name, index_name, column_names, statistics_name, 
 								last_statistics_update, days_since_last_stats_update, rows, modification_counter, 
 								percent_modifications, modifications_before_auto_update, index_type_desc, table_create_date, table_modify_date,
@@ -25442,6 +25523,7 @@ BEGIN
 						LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partition_range_values prve ON prve.function_id = pf.function_id AND prve.boundary_id = p.partition_number ' ELSE N' ' END 
 						+ N' LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_segments seg ON p.partition_id = seg.partition_id AND ic.index_column_id = seg.column_id AND rg.row_group_id = seg.segment_id
 						WHERE rg.object_id = @ObjectID
+						AND rg.state IN (1, 2, 3)
 						AND c.name IN ( ' + @ColumnListWithApostrophes + N')' 
 						+ CASE WHEN @ShowPartitionRanges = 1 THEN N'
 					) AS y ' ELSE N' ' END + N'
@@ -25486,32 +25568,142 @@ END; /* IF @TableName IS NOT NULL */
 
 
 
+ELSE /* @TableName IS NULL, so we operate in normal mode 0/1/2/3/4 */
+BEGIN
+
+/* Validate and check table output params */
+
+
+		/* Checks if @OutputServerName is populated with a valid linked server, and that the database name specified is valid */
+		DECLARE @ValidOutputServer BIT;
+		DECLARE @ValidOutputLocation BIT;
+		DECLARE @LinkedServerDBCheck NVARCHAR(2000);
+		DECLARE @ValidLinkedServerDB INT;
+		DECLARE @tmpdbchk TABLE (cnt INT);
+		
+		IF @OutputServerName IS NOT NULL
+			BEGIN
+				IF (SUBSTRING(@OutputTableName, 2, 1) = '#')
+					BEGIN
+						RAISERROR('Due to the nature of temporary tables, outputting to a linked server requires a permanent table.', 16, 0);
+					END;
+				ELSE IF EXISTS (SELECT server_id FROM sys.servers WHERE QUOTENAME([name]) = @OutputServerName)
+					BEGIN
+						SET @LinkedServerDBCheck = 'SELECT 1 WHERE EXISTS (SELECT * FROM '+@OutputServerName+'.master.sys.databases WHERE QUOTENAME([name]) = '''+@OutputDatabaseName+''')';
+						INSERT INTO @tmpdbchk EXEC sys.sp_executesql @LinkedServerDBCheck;
+						SET @ValidLinkedServerDB = (SELECT COUNT(*) FROM @tmpdbchk);
+						IF (@ValidLinkedServerDB > 0)
+							BEGIN
+								SET @ValidOutputServer = 1;
+								SET @ValidOutputLocation = 1;
+							END;
+						ELSE
+							RAISERROR('The specified database was not found on the output server', 16, 0);
+					END;
+				ELSE
+					BEGIN
+						RAISERROR('The specified output server was not found', 16, 0);
+					END;
+			END;
+		ELSE
+			BEGIN
+				IF (SUBSTRING(@OutputTableName, 2, 2) = '##')
+					BEGIN
+						SET @StringToExecute = N' IF (OBJECT_ID(''[tempdb].[dbo].@@@OutputTableName@@@'') IS NOT NULL) DROP TABLE @@@OutputTableName@@@';
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+						EXEC(@StringToExecute);
+						
+						SET @OutputServerName = QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
+						SET @OutputDatabaseName = '[tempdb]';
+						SET @OutputSchemaName = '[dbo]';
+						SET @ValidOutputLocation = 1;
+					END;
+				ELSE IF (SUBSTRING(@OutputTableName, 2, 1) = '#')
+					BEGIN
+						RAISERROR('Due to the nature of Dymamic SQL, only global (i.e. double pound (##)) temp tables are supported for @OutputTableName', 16, 0);
+					END;
+				ELSE IF @OutputDatabaseName IS NOT NULL
+					AND @OutputSchemaName IS NOT NULL
+					AND @OutputTableName IS NOT NULL
+					AND EXISTS ( SELECT *
+						 FROM   sys.databases
+						 WHERE  QUOTENAME([name]) = @OutputDatabaseName)
+					BEGIN
+						SET @ValidOutputLocation = 1;
+						SET @OutputServerName = QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
+					END;
+				ELSE IF @OutputDatabaseName IS NOT NULL
+					AND @OutputSchemaName IS NOT NULL
+					AND @OutputTableName IS NOT NULL
+					AND NOT EXISTS ( SELECT *
+						 FROM   sys.databases
+						 WHERE  QUOTENAME([name]) = @OutputDatabaseName)
+					BEGIN
+						RAISERROR('The specified output database was not found on this server', 16, 0);
+					END;
+				ELSE
+					BEGIN
+						SET @ValidOutputLocation = 0; 
+					END;
+			END;
+																										
+        IF (@ValidOutputLocation = 0 AND @OutputType = 'NONE')
+        BEGIN
+            RAISERROR('Invalid output location and no output asked',12,1);
+            RETURN;
+        END;
+																										
+		/* @OutputTableName lets us export the results to a permanent table */
+		DECLARE @RunID UNIQUEIDENTIFIER;
+		SET @RunID = NEWID();
+
+		DECLARE @TableExists BIT;
+		DECLARE @SchemaExists BIT;
+
+		DECLARE @TableExistsSql NVARCHAR(MAX);
+
+		IF (@ValidOutputLocation = 1 AND COALESCE(@OutputServerName, @OutputDatabaseName, @OutputSchemaName, @OutputTableName) IS NOT NULL)
+			BEGIN
+				SET @StringToExecute = 
+					N'SET @SchemaExists = 0;
+					SET @TableExists = 0;
+					IF EXISTS(SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.SCHEMATA WHERE QUOTENAME(SCHEMA_NAME) = ''@@@OutputSchemaName@@@'') 
+						SET @SchemaExists = 1
+					IF EXISTS (SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.TABLES WHERE QUOTENAME(TABLE_SCHEMA) = ''@@@OutputSchemaName@@@'' AND QUOTENAME(TABLE_NAME) = ''@@@OutputTableName@@@'')
+					BEGIN
+						SET @TableExists = 1
+						IF NOT EXISTS(SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.COLUMNS WHERE QUOTENAME(TABLE_SCHEMA) = ''@@@OutputSchemaName@@@''
+										AND QUOTENAME(TABLE_NAME) = ''@@@OutputTableName@@@'' AND QUOTENAME(COLUMN_NAME) = ''[total_forwarded_fetch_count]'')
+							EXEC @@@OutputServerName@@@.@@@OutputDatabaseName@@@.dbo.sp_executesql N''ALTER TABLE @@@OutputSchemaName@@@.@@@OutputTableName@@@ ADD [total_forwarded_fetch_count] BIGINT''
+					END';
+	
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputServerName@@@', @OutputServerName);
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName);
+	
+				EXEC sp_executesql @StringToExecute, N'@TableExists BIT OUTPUT, @SchemaExists BIT OUTPUT', @TableExists OUTPUT, @SchemaExists OUTPUT;
+
+
+				SET @TableExistsSql = 
+					N'IF EXISTS(SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.SCHEMATA WHERE QUOTENAME(SCHEMA_NAME) = ''@@@OutputSchemaName@@@'') 
+						AND NOT EXISTS (SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.TABLES WHERE QUOTENAME(TABLE_SCHEMA) = ''@@@OutputSchemaName@@@'' AND QUOTENAME(TABLE_NAME) = ''@@@OutputTableName@@@'')
+						SET @TableExists = 0
+					ELSE
+						SET @TableExists = 1';
+				
+				SET @TableExistsSql = REPLACE(@TableExistsSql, '@@@OutputServerName@@@', @OutputServerName);
+				SET @TableExistsSql = REPLACE(@TableExistsSql, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+				SET @TableExistsSql = REPLACE(@TableExistsSql, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+				SET @TableExistsSql = REPLACE(@TableExistsSql, '@@@OutputTableName@@@', @OutputTableName); 
+
+			END
 
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-ELSE IF @Mode IN (0, 4) /* DIAGNOSE*//* IF @TableName IS NOT NULL, so  @TableName must not be null */
-BEGIN;
+	IF @Mode IN (0, 4) /* DIAGNOSE */
+	BEGIN;
 	IF @Mode IN (0, 4) /* DIAGNOSE priorities 1-100 */
 	BEGIN;
         RAISERROR(N'@Mode=0 or 4, running rules for priorities 1-100.', 0,1) WITH NOWAIT;
@@ -26319,23 +26511,6 @@ BEGIN;
 
 
 	END /* IF @Mode IN (0, 4) DIAGNOSE priorities 1-100 */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -27376,27 +27551,7 @@ BEGIN;
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
+	   	   
         RAISERROR(N'Insert a row to help people find help', 0,1) WITH NOWAIT;
         IF DATEDIFF(MM, @VersionDate, GETDATE()) > 6
 		BEGIN
@@ -27466,65 +27621,345 @@ BEGIN;
         RAISERROR(N'Returning results.', 0,1) WITH NOWAIT;
             
         /*Return results.*/
-        IF (@Mode = 0)
-        BEGIN
-			IF(@OutputType <> 'NONE')
+		IF (@ValidOutputLocation = 1 AND COALESCE(@OutputServerName, @OutputDatabaseName, @OutputSchemaName, @OutputTableName) IS NOT NULL)
 			BEGIN
-				SELECT Priority, ISNULL(br.findings_group,N'') + 
-						CASE WHEN ISNULL(br.finding,N'') <> N'' THEN N': ' ELSE N'' END
-						+ br.finding AS [Finding], 
-					br.[database_name] AS [Database Name],
-					br.details AS [Details: schema.table.index(indexid)], 
-					br.index_definition AS [Definition: [Property]] ColumnName {datatype maxbytes}], 
-					ISNULL(br.secret_columns,'') AS [Secret Columns],          
-					br.index_usage_summary AS [Usage], 
-					br.index_size_summary AS [Size],
-					COALESCE(br.more_info,sn.more_info,'') AS [More Info],
-					br.URL, 
-					COALESCE(br.create_tsql,ts.create_tsql,'') AS [Create TSQL],
-                    br.sample_query_plan AS [Sample Query Plan]
-				FROM #BlitzIndexResults br
-				LEFT JOIN #IndexSanity sn ON 
-					br.index_sanity_id=sn.index_sanity_id
-				LEFT JOIN #IndexCreateTsql ts ON 
-					br.index_sanity_id=ts.index_sanity_id
-				ORDER BY br.Priority ASC, br.check_id ASC, br.blitz_result_id ASC, br.findings_group ASC
-				OPTION (RECOMPILE);
-			 END;
+				IF NOT @SchemaExists = 1
+					BEGIN
+						RAISERROR (N'Invalid schema name, data could not be saved.', 16, 0);
+						RETURN;
+					END
 
-        END;
-        ELSE IF (@Mode = 4)
-			IF(@OutputType <> 'NONE')
-		 	BEGIN	
-				SELECT Priority, ISNULL(br.findings_group,N'') + 
-						CASE WHEN ISNULL(br.finding,N'') <> N'' THEN N': ' ELSE N'' END
-						+ br.finding AS [Finding], 
-					br.[database_name] AS [Database Name],
-					br.details AS [Details: schema.table.index(indexid)], 
-					br.index_definition AS [Definition: [Property]] ColumnName {datatype maxbytes}], 
-					ISNULL(br.secret_columns,'') AS [Secret Columns],          
-					br.index_usage_summary AS [Usage], 
-					br.index_size_summary AS [Size],
-					COALESCE(br.more_info,sn.more_info,'') AS [More Info],
-					br.URL, 
-					COALESCE(br.create_tsql,ts.create_tsql,'') AS [Create TSQL],
-                    br.sample_query_plan AS [Sample Query Plan]
-				FROM #BlitzIndexResults br
-				LEFT JOIN #IndexSanity sn ON 
-					br.index_sanity_id=sn.index_sanity_id
-				LEFT JOIN #IndexCreateTsql ts ON 
-					br.index_sanity_id=ts.index_sanity_id
-				ORDER BY br.Priority ASC, br.check_id ASC, br.blitz_result_id ASC, br.findings_group ASC
-				OPTION (RECOMPILE);
-			 END;
+				IF @TableExists = 0
+					BEGIN
+						SET @StringToExecute = 
+							N'CREATE TABLE @@@OutputDatabaseName@@@.@@@OutputSchemaName@@@.@@@OutputTableName@@@ 
+								(
+									[id] INT IDENTITY(1,1) NOT NULL, 
+									[run_id] UNIQUEIDENTIFIER,
+									[run_datetime] DATETIME, 
+									[server_name] NVARCHAR(128), 
+									[priority] INT,
+									[finding] NVARCHAR(4000),
+									[database_name] NVARCHAR(128),
+									[details] NVARCHAR(MAX),
+									[index_definition] NVARCHAR(MAX),
+									[secret_columns] NVARCHAR(MAX),
+									[index_usage_summary] NVARCHAR(MAX),
+									[index_size_summary] NVARCHAR(MAX),
+									[more_info] NVARCHAR(MAX),
+									[url] NVARCHAR(MAX),
+									[create_tsql] NVARCHAR(MAX),
+									[sample_query_plan] XML,
+									CONSTRAINT [PK_ID_@@@RunID@@@] PRIMARY KEY CLUSTERED ([id] ASC)
+								);';
+		
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@RunID@@@', @RunID); 
+								
+						IF @ValidOutputServer = 1
+							BEGIN
+								SET @StringToExecute = REPLACE(@StringToExecute,'''','''''');
+								EXEC('EXEC('''+@StringToExecute+''') AT ' + @OutputServerName);
+							END;   
+						ELSE
+							BEGIN
+								EXEC(@StringToExecute);
+							END;
+					END; /* @TableExists = 0 */
 
-END /* End @Mode=0 or 4 (diagnose)*/
+				-- Re-check that table now exists (if not we failed creating it)	
+				SET @TableExists = NULL;
+				EXEC sp_executesql @TableExistsSql, N'@TableExists BIT OUTPUT', @TableExists OUTPUT;
+						
+				IF NOT @TableExists = 1
+					BEGIN
+						RAISERROR('Creation of the output table failed.', 16, 0);
+						RETURN;
+					END;
 
-ELSE IF (@Mode=1) /*Summarize*/
+				SET @StringToExecute = 
+					N'INSERT @@@OutputServerName@@@.@@@OutputDatabaseName@@@.@@@OutputSchemaName@@@.@@@OutputTableName@@@
+						(
+							[run_id], 
+							[run_datetime], 
+							[server_name],
+							[priority],
+							[finding],
+							[database_name],
+							[details],
+							[index_definition],
+							[secret_columns],
+							[index_usage_summary],
+							[index_size_summary],
+							[more_info],
+							[url],
+							[create_tsql],
+							[sample_query_plan]
+						)
+					SELECT
+						''@@@RunID@@@'',
+						''@@@GETDATE@@@'',
+						''@@@LocalServerName@@@'',
+						-- Below should be a copy/paste of the real query
+						-- Make sure all quotes are escaped
+						Priority, ISNULL(br.findings_group,N'''') + 
+							CASE WHEN ISNULL(br.finding,N'''') <> N'''' THEN N'': '' ELSE N'''' END
+							+ br.finding AS [Finding], 
+						br.[database_name] AS [Database Name],
+						br.details AS [Details: schema.table.index(indexid)], 
+						br.index_definition AS [Definition: [Property]] ColumnName {datatype maxbytes}], 
+						ISNULL(br.secret_columns,'''') AS [Secret Columns],          
+						br.index_usage_summary AS [Usage], 
+						br.index_size_summary AS [Size],
+						COALESCE(br.more_info,sn.more_info,'''') AS [More Info],
+						br.URL, 
+						COALESCE(br.create_tsql,ts.create_tsql,'''') AS [Create TSQL],
+						br.sample_query_plan AS [Sample Query Plan]
+					FROM #BlitzIndexResults br
+					LEFT JOIN #IndexSanity sn ON 
+						br.index_sanity_id=sn.index_sanity_id
+					LEFT JOIN #IndexCreateTsql ts ON 
+						br.index_sanity_id=ts.index_sanity_id
+					ORDER BY br.Priority ASC, br.check_id ASC, br.blitz_result_id ASC, br.findings_group ASC
+					OPTION (RECOMPILE);';
+	
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputServerName@@@', @OutputServerName);
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@RunID@@@', @RunID);
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@GETDATE@@@', GETDATE());
+				SET @StringToExecute = REPLACE(@StringToExecute, '@@@LocalServerName@@@', CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
+				EXEC(@StringToExecute);
+
+			END
+        ELSE
+			BEGIN
+				IF(@OutputType <> 'NONE')
+				BEGIN
+					SELECT Priority, ISNULL(br.findings_group,N'') + 
+							CASE WHEN ISNULL(br.finding,N'') <> N'' THEN N': ' ELSE N'' END
+							+ br.finding AS [Finding], 
+						br.[database_name] AS [Database Name],
+						br.details AS [Details: schema.table.index(indexid)], 
+						br.index_definition AS [Definition: [Property]] ColumnName {datatype maxbytes}], 
+						ISNULL(br.secret_columns,'') AS [Secret Columns],          
+						br.index_usage_summary AS [Usage], 
+						br.index_size_summary AS [Size],
+						COALESCE(br.more_info,sn.more_info,'') AS [More Info],
+						br.URL, 
+						COALESCE(br.create_tsql,ts.create_tsql,'') AS [Create TSQL],
+						br.sample_query_plan AS [Sample Query Plan]
+					FROM #BlitzIndexResults br
+					LEFT JOIN #IndexSanity sn ON 
+						br.index_sanity_id=sn.index_sanity_id
+					LEFT JOIN #IndexCreateTsql ts ON 
+						br.index_sanity_id=ts.index_sanity_id
+					ORDER BY br.Priority ASC, br.check_id ASC, br.blitz_result_id ASC, br.findings_group ASC
+					OPTION (RECOMPILE);
+				 END;
+
+			END;
+
+	END /* End @Mode=0 or 4 (diagnose)*/
+
+
+
+
+
+
+
+
+	ELSE IF (@Mode=1) /*Summarize*/
     BEGIN
     --This mode is to give some overall stats on the database.
-	 	IF(@OutputType <> 'NONE')
-	 	BEGIN
+		IF (@ValidOutputLocation = 1 AND COALESCE(@OutputServerName, @OutputDatabaseName, @OutputSchemaName, @OutputTableName) IS NOT NULL)
+			BEGIN
+
+				IF NOT @SchemaExists = 1
+					BEGIN
+						RAISERROR (N'Invalid schema name, data could not be saved.', 16, 0);
+						RETURN;
+					END
+
+				IF @TableExists = 0
+					BEGIN
+						SET @StringToExecute = 
+							N'CREATE TABLE @@@OutputDatabaseName@@@.@@@OutputSchemaName@@@.@@@OutputTableName@@@ 
+								(
+									[id] INT IDENTITY(1,1) NOT NULL, 
+									[run_id] UNIQUEIDENTIFIER,
+									[run_datetime] DATETIME, 
+									[server_name] NVARCHAR(128), 
+									[database_name] NVARCHAR(128),
+									[object_count] INT,
+									[reserved_gb] NUMERIC(29,1),
+									[reserved_lob_gb] NUMERIC(29,1),
+									[reserved_row_overflow_gb] NUMERIC(29,1),
+									[clustered_table_count] INT,
+									[clustered_table_gb] NUMERIC(29,1),
+									[nc_index_count] INT,
+									[nc_index_gb] NUMERIC(29,1),
+									[table_nc_index_ratio] NUMERIC(29,1),
+									[heap_count] INT,
+									[heap_gb] NUMERIC(29,1),
+									[partioned_table_count] INT,
+									[partioned_nc_count] INT,
+									[partioned_gb] NUMERIC(29,1),
+									[filtered_index_count] INT,
+									[indexed_view_count] INT,
+									[max_table_row_count] INT,
+									[max_table_gb] NUMERIC(29,1),
+									[max_nc_index_gb] NUMERIC(29,1),
+									[table_count_over_1gb] INT,
+									[table_count_over_10gb] INT,
+									[table_count_over_100gb] INT,    
+									[nc_index_count_over_1gb] INT,
+									[nc_index_count_over_10gb] INT,
+									[nc_index_count_over_100gb] INT,
+									[min_create_date] DATETIME,
+									[max_create_date] DATETIME,
+									[max_modify_date] DATETIME,
+									[display_order] INT,
+									CONSTRAINT [PK_ID_@@@RunID@@@] PRIMARY KEY CLUSTERED ([id] ASC)
+								);';
+		
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@RunID@@@', @RunID); 
+								
+						IF @ValidOutputServer = 1
+							BEGIN
+								SET @StringToExecute = REPLACE(@StringToExecute,'''','''''');
+								EXEC('EXEC('''+@StringToExecute+''') AT ' + @OutputServerName);
+							END;   
+						ELSE
+							BEGIN
+								EXEC(@StringToExecute);
+							END;
+					END; /* @TableExists = 0 */
+
+					-- Re-check that table now exists (if not we failed creating it)	
+					SET @TableExists = NULL;
+					EXEC sp_executesql @TableExistsSql, N'@TableExists BIT OUTPUT', @TableExists OUTPUT;
+						
+					IF NOT @TableExists = 1
+						BEGIN
+							RAISERROR('Creation of the output table failed.', 16, 0);
+							RETURN;
+						END;
+
+					SET @StringToExecute = 
+						N'INSERT @@@OutputServerName@@@.@@@OutputDatabaseName@@@.@@@OutputSchemaName@@@.@@@OutputTableName@@@
+							(
+								[run_id], 
+								[run_datetime], 
+								[server_name], 
+								[database_name],
+								[object_count],
+								[reserved_gb],
+								[reserved_lob_gb],
+								[reserved_row_overflow_gb],
+								[clustered_table_count],
+								[clustered_table_gb],
+								[nc_index_count],
+								[nc_index_gb],
+								[table_nc_index_ratio],
+								[heap_count],
+								[heap_gb],
+								[partioned_table_count],
+								[partioned_nc_count],
+								[partioned_gb],
+								[filtered_index_count],
+								[indexed_view_count],
+								[max_table_row_count],
+								[max_table_gb],
+								[max_nc_index_gb],
+								[table_count_over_1gb],
+								[table_count_over_10gb],
+								[table_count_over_100gb],    
+								[nc_index_count_over_1gb],
+								[nc_index_count_over_10gb],
+								[nc_index_count_over_100gb],
+								[min_create_date],
+								[max_create_date],
+								[max_modify_date],
+								[display_order]
+							)
+						SELECT ''@@@RunID@@@'',
+							''@@@GETDATE@@@'',
+							''@@@LocalServerName@@@'',
+							-- Below should be a copy/paste of the real query
+							-- Make sure all quotes are escaped
+							-- NOTE! information line is skipped from output and the query below
+							-- NOTE! initial columns are not casted to nvarchar due to not outputing informational line
+							DB_NAME(i.database_id) AS [Database Name],
+								COUNT(*) AS [Number Objects],
+								CAST(SUM(sz.total_reserved_MB)/
+									1024. AS NUMERIC(29,1)) AS [All GB],
+								CAST(SUM(sz.total_reserved_LOB_MB)/
+									1024. AS NUMERIC(29,1)) AS [LOB GB],
+								CAST(SUM(sz.total_reserved_row_overflow_MB)/
+									1024. AS NUMERIC(29,1)) AS [Row Overflow GB],
+								SUM(CASE WHEN index_id=1 THEN 1 ELSE 0 END) AS [Clustered Tables],
+								CAST(SUM(CASE WHEN index_id=1 THEN sz.total_reserved_MB ELSE 0 END)
+									/1024. AS NUMERIC(29,1)) AS [Clustered Tables GB],
+								SUM(CASE WHEN index_id NOT IN (0,1) THEN 1 ELSE 0 END) AS [NC Indexes],
+								CAST(SUM(CASE WHEN index_id NOT IN (0,1) THEN sz.total_reserved_MB ELSE 0 END)
+									/1024. AS NUMERIC(29,1)) AS [NC Indexes GB],
+								CASE WHEN SUM(CASE WHEN index_id NOT IN (0,1) THEN sz.total_reserved_MB ELSE 0 END)  > 0 THEN
+									CAST(SUM(CASE WHEN index_id IN (0,1) THEN sz.total_reserved_MB ELSE 0 END)
+										/ SUM(CASE WHEN index_id NOT IN (0,1) THEN sz.total_reserved_MB ELSE 0 END) AS NUMERIC(29,1)) 
+									ELSE 0 END AS [ratio table: NC Indexes],
+								SUM(CASE WHEN index_id=0 THEN 1 ELSE 0 END) AS [Heaps],
+								CAST(SUM(CASE WHEN index_id=0 THEN sz.total_reserved_MB ELSE 0 END)
+									/1024. AS NUMERIC(29,1)) AS [Heaps GB],
+								SUM(CASE WHEN index_id IN (0,1) AND partition_key_column_name IS NOT NULL THEN 1 ELSE 0 END) AS [Partitioned Tables],
+								SUM(CASE WHEN index_id NOT IN (0,1) AND  partition_key_column_name IS NOT NULL THEN 1 ELSE 0 END) AS [Partitioned NCs],
+								CAST(SUM(CASE WHEN partition_key_column_name IS NOT NULL THEN sz.total_reserved_MB ELSE 0 END)/1024. AS NUMERIC(29,1)) AS [Partitioned GB],
+								SUM(CASE WHEN filter_definition <> '''' THEN 1 ELSE 0 END) AS [Filtered Indexes],
+								SUM(CASE WHEN is_indexed_view=1 THEN 1 ELSE 0 END) AS [Indexed Views],
+								MAX(total_rows) AS [Max Row Count],
+								CAST(MAX(CASE WHEN index_id IN (0,1) THEN sz.total_reserved_MB ELSE 0 END)
+									/1024. AS NUMERIC(29,1)) AS [Max Table GB],
+								CAST(MAX(CASE WHEN index_id NOT IN (0,1) THEN sz.total_reserved_MB ELSE 0 END)
+									/1024. AS NUMERIC(29,1)) AS [Max NC Index GB],
+								SUM(CASE WHEN index_id IN (0,1) AND sz.total_reserved_MB > 1024 THEN 1 ELSE 0 END) AS [Count Tables > 1GB],
+								SUM(CASE WHEN index_id IN (0,1) AND sz.total_reserved_MB > 10240 THEN 1 ELSE 0 END) AS [Count Tables > 10GB],
+								SUM(CASE WHEN index_id IN (0,1) AND sz.total_reserved_MB > 102400 THEN 1 ELSE 0 END) AS [Count Tables > 100GB],    
+								SUM(CASE WHEN index_id NOT IN (0,1) AND sz.total_reserved_MB > 1024 THEN 1 ELSE 0 END) AS [Count NCs > 1GB],
+								SUM(CASE WHEN index_id NOT IN (0,1) AND sz.total_reserved_MB > 10240 THEN 1 ELSE 0 END) AS [Count NCs > 10GB],
+								SUM(CASE WHEN index_id NOT IN (0,1) AND sz.total_reserved_MB > 102400 THEN 1 ELSE 0 END) AS [Count NCs > 100GB],
+								MIN(create_date) AS [Oldest Create Date],
+								MAX(create_date) AS [Most Recent Create Date],
+								MAX(modify_date) AS [Most Recent Modify Date],
+								1 AS [Display Order]
+							FROM #IndexSanity AS i
+							--left join here so we don''t lose disabled nc indexes
+							LEFT JOIN #IndexSanitySize AS sz 
+								ON i.index_sanity_id=sz.index_sanity_id
+							GROUP BY DB_NAME(i.database_id)
+							ORDER BY [Display Order] ASC
+							OPTION (RECOMPILE);';
+	
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputServerName@@@', @OutputServerName);
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@RunID@@@', @RunID);
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@GETDATE@@@', GETDATE());
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@LocalServerName@@@', CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
+					EXEC(@StringToExecute);
+
+			END; /* @ValidOutputLocation = 1 */
+		ELSE
+			BEGIN
+				IF(@OutputType <> 'NONE')
+				BEGIN
+
 			RAISERROR(N'@Mode=1, we are summarizing.', 0,1) WITH NOWAIT;
 
 			SELECT DB_NAME(i.database_id) AS [Database Name],
@@ -27584,123 +28019,26 @@ ELSE IF (@Mode=1) /*Summarize*/
 					NULL,NULL,0 AS display_order
 			ORDER BY [Display Order] ASC
 			OPTION (RECOMPILE);
-	  	END;
-           
+  			END;
+		END;
+
     END; /* End @Mode=1 (summarize)*/
-    ELSE IF (@Mode=2) /*Index Detail*/
+
+
+
+
+
+
+
+
+	ELSE IF (@Mode=2) /*Index Detail*/
     BEGIN
         --This mode just spits out all the detail without filters.
         --This supports slicing AND dicing in Excel
         RAISERROR(N'@Mode=2, here''s the details on existing indexes.', 0,1) WITH NOWAIT;
 
-		
-		/* Checks if @OutputServerName is populated with a valid linked server, and that the database name specified is valid */
-		DECLARE @ValidOutputServer BIT;
-		DECLARE @ValidOutputLocation BIT;
-		DECLARE @LinkedServerDBCheck NVARCHAR(2000);
-		DECLARE @ValidLinkedServerDB INT;
-		DECLARE @tmpdbchk TABLE (cnt INT);
-		
-		IF @OutputServerName IS NOT NULL
-			BEGIN
-				IF (SUBSTRING(@OutputTableName, 2, 1) = '#')
-					BEGIN
-						RAISERROR('Due to the nature of temporary tables, outputting to a linked server requires a permanent table.', 16, 0);
-					END;
-				ELSE IF EXISTS (SELECT server_id FROM sys.servers WHERE QUOTENAME([name]) = @OutputServerName)
-					BEGIN
-						SET @LinkedServerDBCheck = 'SELECT 1 WHERE EXISTS (SELECT * FROM '+@OutputServerName+'.master.sys.databases WHERE QUOTENAME([name]) = '''+@OutputDatabaseName+''')';
-						INSERT INTO @tmpdbchk EXEC sys.sp_executesql @LinkedServerDBCheck;
-						SET @ValidLinkedServerDB = (SELECT COUNT(*) FROM @tmpdbchk);
-						IF (@ValidLinkedServerDB > 0)
-							BEGIN
-								SET @ValidOutputServer = 1;
-								SET @ValidOutputLocation = 1;
-							END;
-						ELSE
-							RAISERROR('The specified database was not found on the output server', 16, 0);
-					END;
-				ELSE
-					BEGIN
-						RAISERROR('The specified output server was not found', 16, 0);
-					END;
-			END;
-		ELSE
-			BEGIN
-				IF (SUBSTRING(@OutputTableName, 2, 2) = '##')
-					BEGIN
-						SET @StringToExecute = N' IF (OBJECT_ID(''[tempdb].[dbo].@@@OutputTableName@@@'') IS NOT NULL) DROP TABLE @@@OutputTableName@@@';
-						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
-						EXEC(@StringToExecute);
-						
-						SET @OutputServerName = QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
-						SET @OutputDatabaseName = '[tempdb]';
-						SET @OutputSchemaName = '[dbo]';
-						SET @ValidOutputLocation = 1;
-					END;
-				ELSE IF (SUBSTRING(@OutputTableName, 2, 1) = '#')
-					BEGIN
-						RAISERROR('Due to the nature of Dymamic SQL, only global (i.e. double pound (##)) temp tables are supported for @OutputTableName', 16, 0);
-					END;
-				ELSE IF @OutputDatabaseName IS NOT NULL
-					AND @OutputSchemaName IS NOT NULL
-					AND @OutputTableName IS NOT NULL
-					AND EXISTS ( SELECT *
-						 FROM   sys.databases
-						 WHERE  QUOTENAME([name]) = @OutputDatabaseName)
-					BEGIN
-						SET @ValidOutputLocation = 1;
-						SET @OutputServerName = QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
-					END;
-				ELSE IF @OutputDatabaseName IS NOT NULL
-					AND @OutputSchemaName IS NOT NULL
-					AND @OutputTableName IS NOT NULL
-					AND NOT EXISTS ( SELECT *
-						 FROM   sys.databases
-						 WHERE  QUOTENAME([name]) = @OutputDatabaseName)
-					BEGIN
-						RAISERROR('The specified output database was not found on this server', 16, 0);
-					END;
-				ELSE
-					BEGIN
-						SET @ValidOutputLocation = 0; 
-					END;
-			END;
-																										
-        IF (@ValidOutputLocation = 0 AND @OutputType = 'NONE')
-        BEGIN
-            RAISERROR('Invalid output location and no output asked',12,1);
-            RETURN;
-        END;
-																										
-		/* @OutputTableName lets us export the results to a permanent table */
-		DECLARE @RunID UNIQUEIDENTIFIER;
-		SET @RunID = NEWID();
-		
 		IF (@ValidOutputLocation = 1 AND COALESCE(@OutputServerName, @OutputDatabaseName, @OutputSchemaName, @OutputTableName) IS NOT NULL)
 			BEGIN
-				DECLARE @TableExists BIT;
-				DECLARE @SchemaExists BIT;
-				SET @StringToExecute = 
-					N'SET @SchemaExists = 0;
-					SET @TableExists = 0;
-					IF EXISTS(SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.SCHEMATA WHERE QUOTENAME(SCHEMA_NAME) = ''@@@OutputSchemaName@@@'') 
-						SET @SchemaExists = 1
-					IF EXISTS (SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.TABLES WHERE QUOTENAME(TABLE_SCHEMA) = ''@@@OutputSchemaName@@@'' AND QUOTENAME(TABLE_NAME) = ''@@@OutputTableName@@@'')
-					BEGIN
-						SET @TableExists = 1
-						IF NOT EXISTS(SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.COLUMNS WHERE QUOTENAME(TABLE_SCHEMA) = ''@@@OutputSchemaName@@@''
-										AND QUOTENAME(TABLE_NAME) = ''@@@OutputTableName@@@'' AND QUOTENAME(COLUMN_NAME) = ''[total_forwarded_fetch_count]'')
-							EXEC @@@OutputServerName@@@.@@@OutputDatabaseName@@@.dbo.sp_executesql N''ALTER TABLE @@@OutputSchemaName@@@.@@@OutputTableName@@@ ADD [total_forwarded_fetch_count] BIGINT''
-					END';
-	
-				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputServerName@@@', @OutputServerName);
-				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
-				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
-				SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName);
-	
-				EXEC sp_executesql @StringToExecute, N'@TableExists BIT OUTPUT, @SchemaExists BIT OUTPUT', @TableExists OUTPUT, @SchemaExists OUTPUT;
-				
 				IF @SchemaExists = 1
 					BEGIN
 						IF @TableExists = 0
@@ -27801,20 +28139,10 @@ ELSE IF (@Mode=1) /*Summarize*/
 									END;
 							END; /* @TableExists = 0 */
 					
-						SET @StringToExecute = 
-							N'IF EXISTS(SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.SCHEMATA WHERE QUOTENAME(SCHEMA_NAME) = ''@@@OutputSchemaName@@@'') 
-								AND NOT EXISTS (SELECT * FROM @@@OutputServerName@@@.@@@OutputDatabaseName@@@.INFORMATION_SCHEMA.TABLES WHERE QUOTENAME(TABLE_SCHEMA) = ''@@@OutputSchemaName@@@'' AND QUOTENAME(TABLE_NAME) = ''@@@OutputTableName@@@'')
-								SET @TableExists = 0
-							ELSE
-								SET @TableExists = 1';
-				
+
+						-- Re-check that table now exists (if not we failed creating it)	
 						SET @TableExists = NULL;
-						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputServerName@@@', @OutputServerName);
-						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
-						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
-						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
-			
-						EXEC sp_executesql @StringToExecute, N'@TableExists BIT OUTPUT', @TableExists OUTPUT;
+						EXEC sp_executesql @TableExistsSql, N'@TableExists BIT OUTPUT', @TableExists OUTPUT;
 						
 						IF @TableExists = 1
 							BEGIN
@@ -28142,10 +28470,167 @@ ELSE IF (@Mode=1) /*Summarize*/
   		END;
 
     END; /* End @Mode=2 (index detail)*/
+
+
+
+
+
+
+
+
     ELSE IF (@Mode=3) /*Missing index Detail*/
     BEGIN
-		IF(@OutputType <> 'NONE')
-		BEGIN;
+		IF (@ValidOutputLocation = 1 AND COALESCE(@OutputServerName, @OutputDatabaseName, @OutputSchemaName, @OutputTableName) IS NOT NULL)
+			BEGIN
+
+				IF NOT @SchemaExists = 1
+					BEGIN
+						RAISERROR (N'Invalid schema name, data could not be saved.', 16, 0);
+						RETURN;
+					END
+
+				IF @TableExists = 0
+					BEGIN
+						SET @StringToExecute = 
+							N'CREATE TABLE @@@OutputDatabaseName@@@.@@@OutputSchemaName@@@.@@@OutputTableName@@@ 
+								(
+									[id] INT IDENTITY(1,1) NOT NULL, 
+									[run_id] UNIQUEIDENTIFIER,
+									[run_datetime] DATETIME, 
+									[server_name] NVARCHAR(128),  
+									[database_name] NVARCHAR(128), 
+									[schema_name] NVARCHAR(128),
+									[table_name] NVARCHAR(128),
+									[magic_benefit_number] BIGINT,
+									[missing_index_details] NVARCHAR(MAX),
+									[avg_total_user_cost] NUMERIC(29,4),
+									[avg_user_impact] NUMERIC(29,1),
+									[user_seeks] BIGINT,
+									[user_scans] BIGINT,
+									[unique_compiles] BIGINT,
+									[equality_columns_with_data_type] NVARCHAR(MAX),
+									[inequality_columns_with_data_type] NVARCHAR(MAX),
+									[included_columns_with_data_type] NVARCHAR(MAX),
+									[index_estimated_impact] NVARCHAR(256),
+									[create_tsql] NVARCHAR(MAX),
+									[more_info] NVARCHAR(600),
+									[display_order] INT,
+									[is_low] BIT,
+									[sample_query_plan] XML,
+									CONSTRAINT [PK_ID_@@@RunID@@@] PRIMARY KEY CLUSTERED ([id] ASC)
+								);';
+		
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+						SET @StringToExecute = REPLACE(@StringToExecute, '@@@RunID@@@', @RunID); 
+								
+						IF @ValidOutputServer = 1
+							BEGIN
+								SET @StringToExecute = REPLACE(@StringToExecute,'''','''''');
+								EXEC('EXEC('''+@StringToExecute+''') AT ' + @OutputServerName);
+							END;   
+						ELSE
+							BEGIN
+								EXEC(@StringToExecute);
+							END;
+					END; /* @TableExists = 0 */
+
+					-- Re-check that table now exists (if not we failed creating it)	
+					SET @TableExists = NULL;
+					EXEC sp_executesql @TableExistsSql, N'@TableExists BIT OUTPUT', @TableExists OUTPUT;
+						
+					IF NOT @TableExists = 1
+						BEGIN
+							RAISERROR('Creation of the output table failed.', 16, 0);
+							RETURN;
+						END;
+					SET @StringToExecute = 
+						N'WITH create_date AS (
+									SELECT i.database_id,
+										   i.schema_name,
+										   i.[object_id], 
+										   ISNULL(NULLIF(MAX(DATEDIFF(DAY, i.create_date, SYSDATETIME())), 0), 1) AS create_days
+									FROM #IndexSanity AS i
+									GROUP BY i.database_id, i.schema_name, i.object_id
+									)
+						INSERT @@@OutputServerName@@@.@@@OutputDatabaseName@@@.@@@OutputSchemaName@@@.@@@OutputTableName@@@
+							(
+								[run_id], 
+								[run_datetime], 
+								[server_name], 
+								[database_name], 
+								[schema_name],
+								[table_name],
+								[magic_benefit_number],
+								[missing_index_details],
+								[avg_total_user_cost],
+								[avg_user_impact],
+								[user_seeks],
+								[user_scans],
+								[unique_compiles],
+								[equality_columns_with_data_type],
+								[inequality_columns_with_data_type],
+								[included_columns_with_data_type],
+								[index_estimated_impact],
+								[create_tsql],
+								[more_info],
+								[display_order],
+								[is_low],
+								[sample_query_plan]
+							)
+						SELECT ''@@@RunID@@@'',
+							''@@@GETDATE@@@'',
+							''@@@LocalServerName@@@'',
+							-- Below should be a copy/paste of the real query
+							-- Make sure all quotes are escaped
+							-- NOTE! information line is skipped from output and the query below
+							-- NOTE! CTE block is above insert in the copied SQL
+							mi.database_name AS [Database Name], 
+							mi.[schema_name] AS [Schema], 
+							mi.table_name AS [Table], 
+							CAST((mi.magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) AS BIGINT)
+								AS [Magic Benefit Number], 
+							mi.missing_index_details AS [Missing Index Details], 
+							mi.avg_total_user_cost AS [Avg Query Cost], 
+							mi.avg_user_impact AS [Est Index Improvement], 
+							mi.user_seeks AS [Seeks], 
+							mi.user_scans AS [Scans],
+							mi.unique_compiles AS [Compiles],
+							mi.equality_columns_with_data_type AS [Equality Columns],
+							mi.inequality_columns_with_data_type AS [Inequality Columns],
+							mi.included_columns_with_data_type AS [Included Columns], 
+							mi.index_estimated_impact AS [Estimated Impact], 
+							mi.create_tsql AS [Create TSQL], 
+							mi.more_info AS [More Info],
+							1 AS [Display Order],
+							mi.is_low,
+							mi.sample_query_plan AS [Sample Query Plan]
+						FROM #MissingIndexes AS mi
+						LEFT JOIN create_date AS cd
+						ON mi.[object_id] =  cd.object_id 
+						AND mi.database_id = cd.database_id
+						AND mi.schema_name = cd.schema_name
+						/* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
+						WHERE @ShowAllMissingIndexRequests=1 
+						OR (mi.magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000
+						ORDER BY [Display Order] ASC, [Magic Benefit Number] DESC
+						OPTION (RECOMPILE);';
+	
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputServerName@@@', @OutputServerName);
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputDatabaseName@@@', @OutputDatabaseName);
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputSchemaName@@@', @OutputSchemaName); 
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@OutputTableName@@@', @OutputTableName); 
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@RunID@@@', @RunID);
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@GETDATE@@@', GETDATE());
+					SET @StringToExecute = REPLACE(@StringToExecute, '@@@LocalServerName@@@', CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)));
+					EXEC sp_executesql @StringToExecute, N'@DaysUptime NUMERIC(23,2), @ShowAllMissingIndexRequests BIT', @DaysUptime = @DaysUptime, @ShowAllMissingIndexRequests = @ShowAllMissingIndexRequests;
+
+			END; /* @ValidOutputLocation = 1 */
+		ELSE
+			BEGIN
+				IF(@OutputType <> 'NONE')
+				BEGIN
 			WITH create_date AS (
 						SELECT i.database_id,
 							   i.schema_name,
@@ -28194,21 +28679,26 @@ ELSE IF (@Mode=1) /*Summarize*/
 				NULL, NULL, NULL, NULL, 0 AS [Display Order], NULL AS is_low, NULL
 			ORDER BY [Display Order] ASC, [Magic Benefit Number] DESC
 			OPTION (RECOMPILE);
-	  	END;
+  				END;
 
-	IF  (@BringThePain = 1
-	AND @DatabaseName IS NOT NULL
-	AND @GetAllDatabases = 0)
 
-	BEGIN
+				IF  (@BringThePain = 1
+				AND @DatabaseName IS NOT NULL
+				AND @GetAllDatabases = 0)
 
-		EXEC sp_BlitzCache @SortOrder = 'sp_BlitzIndex', @DatabaseName = @DatabaseName, @BringThePain = 1, @QueryFilter = 'statement', @HideSummary = 1;
-	                              
-	END;
+				BEGIN
+					EXEC sp_BlitzCache @SortOrder = 'sp_BlitzIndex', @DatabaseName = @DatabaseName, @BringThePain = 1, @QueryFilter = 'statement', @HideSummary = 1;        
+				END;
+
+			END;
+
+
+
 
 
     END; /* End @Mode=3 (index detail)*/
 
+END /* End @TableName IS NULL (mode 0/1/2/3/4) */
 END TRY
 
 BEGIN CATCH
@@ -28228,1817 +28718,3629 @@ BEGIN CATCH
     END CATCH;
 GO
 IF OBJECT_ID('dbo.sp_BlitzLock') IS NULL
-  EXEC ('CREATE PROCEDURE dbo.sp_BlitzLock AS RETURN 0;');
+BEGIN
+    EXEC ('CREATE PROCEDURE dbo.sp_BlitzLock AS RETURN 0;');
+END;
 GO
 
-ALTER PROCEDURE dbo.sp_BlitzLock
+ALTER PROCEDURE
+    dbo.sp_BlitzLock
 (
-    @Top INT = 2147483647, 
-	@DatabaseName NVARCHAR(256) = NULL,
-	@StartDate DATETIME = '19000101', 
-	@EndDate DATETIME = '99991231', 
-	@ObjectName NVARCHAR(1000) = NULL,
-	@StoredProcName NVARCHAR(1000) = NULL,
-	@AppName NVARCHAR(256) = NULL,
-	@HostName NVARCHAR(256) = NULL,
-	@LoginName NVARCHAR(256) = NULL,
-	@EventSessionPath VARCHAR(256) = 'system_health*.xel',
-	@VictimsOnly BIT = 0,
-	@Debug BIT = 0, 
-	@Help BIT = 0,
-	@Version     VARCHAR(30) = NULL OUTPUT,
-	@VersionDate DATETIME = NULL OUTPUT,
-    @VersionCheckMode BIT = 0,
-	@OutputDatabaseName NVARCHAR(256) = NULL ,
-    @OutputSchemaName NVARCHAR(256) = 'dbo' ,  --ditto as below
-    @OutputTableName NVARCHAR(256) = 'BlitzLock',  --put a standard here no need to check later in the script
-    @ExportToExcel BIT = 0
+    @DatabaseName sysname = NULL,
+    @StartDate datetime = NULL,
+    @EndDate datetime = NULL,
+    @ObjectName nvarchar(1024) = NULL,
+    @StoredProcName nvarchar(1024) = NULL,
+    @AppName sysname = NULL,
+    @HostName sysname = NULL,
+    @LoginName sysname = NULL,
+    @EventSessionName sysname = N'system_health',
+    @TargetSessionType sysname = NULL,
+    @VictimsOnly bit = 0,
+    @Debug bit = 0,
+    @Help bit = 0,
+    @Version varchar(30) = NULL OUTPUT,
+    @VersionDate datetime = NULL OUTPUT,
+    @VersionCheckMode bit = 0,
+    @OutputDatabaseName sysname = NULL,
+    @OutputSchemaName sysname = N'dbo',      /*ditto as below*/
+    @OutputTableName sysname = N'BlitzLock', /*put a standard here no need to check later in the script*/
+    @ExportToExcel bit = 0
 )
 WITH RECOMPILE
 AS
 BEGIN
+    SET STATISTICS XML OFF;
+    SET NOCOUNT, XACT_ABORT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SET NOCOUNT ON;
-SET STATISTICS XML OFF;
-SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+    SELECT @Version = '8.13', @VersionDate = '20230215';
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+    IF @VersionCheckMode = 1
+    BEGIN
+        RETURN;
+    END;
 
+    IF @Help = 1
+    BEGIN
+        PRINT N'
+    /*
+    sp_BlitzLock from http://FirstResponderKit.org
 
-IF(@VersionCheckMode = 1)
-BEGIN
-	RETURN;
-END;
-	IF @Help = 1 
-	BEGIN
-	PRINT '
-	/*
-	sp_BlitzLock from http://FirstResponderKit.org
-	
-	This script checks for and analyzes deadlocks from the system health session or a custom extended event path
+    This script checks for and analyzes deadlocks from the system health session or a custom extended event path
 
-	Variables you can use:
-		@Top: Use if you want to limit the number of deadlocks to return.
-			  This is ordered by event date ascending
+    Variables you can use:
 
-		@DatabaseName: If you want to filter to a specific database
+        @DatabaseName: If you want to filter to a specific database
 
-		@StartDate: The date you want to start searching on.
+        @StartDate: The date you want to start searching on, defaults to last 7 days
 
-		@EndDate: The date you want to stop searching on.
+        @EndDate: The date you want to stop searching on, defaults to current date
 
-		@ObjectName: If you want to filter to a specific able. 
-					 The object name has to be fully qualified ''Database.Schema.Table''
+        @ObjectName: If you want to filter to a specific able.
+                     The object name has to be fully qualified ''Database.Schema.Table''
 
-		@StoredProcName: If you want to search for a single stored proc
-					 The proc name has to be fully qualified ''Database.Schema.Sproc''
-		
-		@AppName: If you want to filter to a specific application
-		
-		@HostName: If you want to filter to a specific host
-		
-		@LoginName: If you want to filter to a specific login
+        @StoredProcName: If you want to search for a single stored proc
+                     The proc name has to be fully qualified ''Database.Schema.Sproc''
 
-		@EventSessionPath: If you want to point this at an XE session rather than the system health session.
-	
-		@OutputDatabaseName: If you want to output information to a specific database
-		@OutputSchemaName: Specify a schema name to output information to a specific Schema
-		@OutputTableName: Specify table name to to output information to a specific table
-	
-	To learn more, visit http://FirstResponderKit.org where you can download new
-	versions for free, watch training videos on how it works, get more info on
-	the findings, contribute your own code, and more.
+        @AppName: If you want to filter to a specific application
 
-	Known limitations of this version:
-	 - Only SQL Server 2012 and newer is supported
-	 - If your tables have weird characters in them (https://en.wikipedia.org/wiki/List_of_XML_and_HTML_character_entity_references) you may get errors trying to parse the XML.
-	   I took a long look at this one, and:
-		1) Trying to account for all the weird places these could crop up is a losing effort. 
-		2) Replace is slow af on lots of XML.
+        @HostName: If you want to filter to a specific host
 
+        @LoginName: If you want to filter to a specific login
 
+        @EventSessionName: If you want to point this at an XE session rather than the system health session.
 
+        @TargetSessionType: Can be ''ring_buffer'' or ''event_file''. Leave NULL to auto-detect.
 
-	Unknown limitations of this version:
-	 - None.  (If we knew them, they would be known. Duh.)
+        @OutputDatabaseName: If you want to output information to a specific database
 
+        @OutputSchemaName: Specify a schema name to output information to a specific Schema
+
+        @OutputTableName: Specify table name to to output information to a specific table
+
+    To learn more, visit http://FirstResponderKit.org where you can download new
+    versions for free, watch training videos on how it works, get more info on
+    the findings, contribute your own code, and more.
+
+    Known limitations of this version:
+     - Only SQL Server 2012 and newer is supported
+     - If your tables have weird characters in them (https://en.wikipedia.org/wiki/List_of_xml_and_HTML_character_entity_references) you may get errors trying to parse the xml.
+       I took a long look at this one, and:
+        1) Trying to account for all the weird places these could crop up is a losing effort.
+        2) Replace is slow af on lots of xml.
+
+    Unknown limitations of this version:
+     - None.  (If we knew them, they would be known. Duh.)
 
     MIT License
-	   
-	Copyright (c) 2021 Brent Ozar Unlimited
 
-	Permission is hereby granted, free of charge, to any person obtaining a copy
-	of this software and associated documentation files (the "Software"), to deal
-	in the Software without restriction, including without limitation the rights
-	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-	copies of the Software, and to permit persons to whom the Software is
-	furnished to do so, subject to the following conditions:
+    Copyright (c) Brent Ozar Unlimited
 
-	The above copyright notice and this permission notice shall be included in all
-	copies or substantial portions of the Software.
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
 
-	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-	SOFTWARE.
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
 
-	*/';
-	RETURN;
-	END;    /* @Help = 1 */
-	
-        DECLARE @ProductVersion NVARCHAR(128), 
-			@ProductVersionMajor FLOAT,
-			@ProductVersionMinor INT,
-			@ObjectFullName NVARCHAR(2000);
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
 
+    */';
 
-        SET @ProductVersion = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128));
+        RETURN;
+    END; /* @Help = 1 */
 
-        SELECT @ProductVersionMajor = SUBSTRING(@ProductVersion, 1, CHARINDEX('.', @ProductVersion) + 1),
-               @ProductVersionMinor = PARSENAME(CONVERT(VARCHAR(32), @ProductVersion), 2);
+    /*Declare local variables used in the procudure*/
+    DECLARE
+        @DatabaseId int =
+            DB_ID(@DatabaseName),
+        @ProductVersion nvarchar(128) =
+            CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)),
+        @ProductVersionMajor float =
+            SUBSTRING
+            (
+                CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)),
+                1,
+                CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))) + 1
+            ),
+        @ProductVersionMinor int =
+            PARSENAME
+            (
+                CONVERT
+                (
+                    varchar(32),
+                    CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))
+                ),
+                2
+            ),
+        @ObjectFullName nvarchar(MAX) = N'',
+        @Azure bit =
+            CASE
+                WHEN
+                (
+                    SELECT
+                        SERVERPROPERTY('EDITION')
+                ) = 'SQL Azure'
+                THEN 1
+                ELSE 0
+            END,
+        @RDS bit =
+            CASE
+                WHEN LEFT(CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS varchar(8000)), 8) <> 'EC2AMAZ-'
+                AND  LEFT(CAST(SERVERPROPERTY('MachineName') AS varchar(8000)), 8) <> 'EC2AMAZ-'
+                AND  DB_ID('rdsadmin') IS NULL
+                THEN 0
+                ELSE 1
+            END,
+        @d varchar(40) = '',
+        @StringToExecute nvarchar(4000) = N'',
+        @StringToExecuteParams nvarchar(500) = N'',
+        @r sysname = NULL,
+        @OutputTableFindings nvarchar(100) = N'[BlitzLockFindings]',
+        @DeadlockCount int = 0,
+        @ServerName sysname = @@SERVERNAME,
+        @OutputDatabaseCheck bit = -1,
+        @SessionId int = 0,
+        @TargetSessionId int = 0,
+        @FileName nvarchar(4000) = N'',
+        @inputbuf_bom nvarchar(1) = CONVERT(nvarchar(1), 0x0a00, 0),
+        @deadlock_result nvarchar(MAX) = N'';
 
+    /*Temporary objects used in the procedure*/
+    DECLARE
+        @sysAssObjId AS table
+    (
+        database_id int,
+        partition_id bigint,
+        schema_name sysname,
+        table_name sysname
+    );
 
-        IF @ProductVersionMajor < 11.0
-            BEGIN
-                RAISERROR(
-                    'sp_BlitzLock will throw a bunch of angry errors on versions of SQL Server earlier than 2012.',
-                    0,
-                    1) WITH NOWAIT;
-                RETURN;
+    CREATE TABLE
+        #x
+    (
+        x xml NOT NULL
+            DEFAULT N'<x>x</x>'
+    );
+
+    CREATE TABLE
+        #deadlock_data
+    (
+        deadlock_xml xml NOT NULL
+            DEFAULT N'<x>x</x>'
+    );
+
+    CREATE TABLE
+        #t
+    (
+        id int NOT NULL
+    );
+
+    CREATE TABLE
+        #deadlock_findings
+    (
+        id int IDENTITY PRIMARY KEY,
+        check_id int NOT NULL,
+        database_name nvarchar(256),
+        object_name nvarchar(1000),
+        finding_group nvarchar(100),
+        finding nvarchar(4000)
+    );
+
+    /*Set these to some sane defaults if NULLs are passed in*/
+    /*Normally I'd hate this, but we RECOMPILE everything*/
+    SELECT
+        @StartDate =
+        CASE
+            WHEN @StartDate IS NULL
+                THEN
+                    DATEADD
+                    (
+                        MINUTE,
+                        DATEDIFF
+                        (
+                            MINUTE,
+                            SYSDATETIME(),
+                            GETUTCDATE()
+                        ),
+                        ISNULL
+                        (
+                            @StartDate,
+                            DATEADD
+                            (
+                                DAY,
+                                -7,
+                                SYSDATETIME()
+                            )
+                        )
+                    )
+                ELSE @StartDate
+            END,
+        @EndDate =
+            CASE
+                WHEN @EndDate IS NULL
+                THEN
+                    DATEADD
+                    (
+                        MINUTE,
+                        DATEDIFF
+                        (
+                            MINUTE,
+                            SYSDATETIME(),
+                            GETUTCDATE()
+                        ),
+                        ISNULL
+                        (
+                            @EndDate,
+                            SYSDATETIME()
+                        )
+                    )
+                ELSE @EndDate
             END;
-        
-        IF ((SELECT SERVERPROPERTY ('EDITION')) = 'SQL Azure'
-             AND 
-             LOWER(@EventSessionPath) NOT LIKE 'http%')
-            BEGIN
-                    RAISERROR(
-                    'The default storage path doesn''t work in Azure SQLDB/Managed instances.
-You need to use an Azure storage account, and the path has to look like this: https://StorageAccount.blob.core.windows.net/Container/FileName.xel',
-                    0,
-                    1) WITH NOWAIT;
-                RETURN;
-            END;
 
+    IF @OutputDatabaseName IS NOT NULL
+    BEGIN /*IF databaseName is set, do some sanity checks and put [] around def.*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('@OutputDatabaseName set to %s, checking validity at %s', 0, 1, @OutputDatabaseName, @d) WITH NOWAIT;
 
-		IF @Top IS NULL
-			SET @Top = 2147483647;
-
-		IF @StartDate IS NULL
-			SET @StartDate = '19000101';
-
-		IF @EndDate IS NULL
-			SET @EndDate = '99991231';
-		
-
-        IF OBJECT_ID('tempdb..#deadlock_data') IS NOT NULL
-            DROP TABLE #deadlock_data;
-
-        IF OBJECT_ID('tempdb..#deadlock_process') IS NOT NULL
-            DROP TABLE #deadlock_process;
-
-        IF OBJECT_ID('tempdb..#deadlock_stack') IS NOT NULL
-            DROP TABLE #deadlock_stack;
-
-        IF OBJECT_ID('tempdb..#deadlock_resource') IS NOT NULL
-            DROP TABLE #deadlock_resource;
-
-        IF OBJECT_ID('tempdb..#deadlock_owner_waiter') IS NOT NULL
-            DROP TABLE #deadlock_owner_waiter;
-
-        IF OBJECT_ID('tempdb..#deadlock_findings') IS NOT NULL
-            DROP TABLE #deadlock_findings;
-
-		CREATE TABLE #deadlock_findings
-		(
-		    id INT IDENTITY(1, 1) PRIMARY KEY CLUSTERED,
-		    check_id INT NOT NULL,
-			database_name NVARCHAR(256),
-			object_name NVARCHAR(1000),
-			finding_group NVARCHAR(100),
-			finding NVARCHAR(4000)
-		);
-
-		DECLARE @d VARCHAR(40), @StringToExecute NVARCHAR(4000),@StringToExecuteParams NVARCHAR(500),@r NVARCHAR(200),@OutputTableFindings NVARCHAR(100),@DeadlockCount INT;
-		DECLARE @ServerName NVARCHAR(256)
-		DECLARE @OutputDatabaseCheck BIT;
-		SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-		SET @OutputTableFindings = '[BlitzLockFindings]'
-		SET @ServerName = (select @@ServerName)
-		if(@OutputDatabaseName is not null)
-		BEGIN --if databaseName is set do some sanity checks and put [] around def.
-			if( (select name from sys.databases where name=@OutputDatabaseName) is null ) --if database is invalid raiserror and set bitcheck
-				BEGIN
-					RAISERROR('Database Name for output of table is invalid please correct, Output to Table will not be preformed', 0, 1, @d) WITH NOWAIT;	
-					set @OutputDatabaseCheck = -1 -- -1 invalid/false, 0 = good/true
-				END
-			ELSE
-				BEGIN
-					set @OutputDatabaseCheck = 0
-					select @StringToExecute = N'select @r = name from ' + '' + @OutputDatabaseName + 
-					'' + '.sys.objects where type_desc=''USER_TABLE'' and name=' + '''' + @OutputTableName + '''',
-					@StringToExecuteParams = N'@OutputDatabaseName NVARCHAR(200),@OutputTableName NVARCHAR(200),@r NVARCHAR(200) OUTPUT'
-					exec sp_executesql @StringToExecute,@StringToExecuteParams,@OutputDatabaseName,@OutputTableName,@r OUTPUT
-					--put covers around all before.
-					SELECT @OutputDatabaseName = QUOTENAME(@OutputDatabaseName),
-					@OutputTableName = QUOTENAME(@OutputTableName), 
-					@OutputSchemaName = QUOTENAME(@OutputSchemaName) 
-					if(@r is not null) --if it is not null, there is a table, so check for newly added columns
-					BEGIN
-						/* If the table doesn't have the new spid column, add it. See Github #3101. */
-						SET @ObjectFullName = @OutputDatabaseName + N'.' + @OutputSchemaName + N'.' +  @OutputTableName;
-						SET @StringToExecute = N'IF NOT EXISTS (SELECT * FROM ' + @OutputDatabaseName + N'.sys.all_columns 
-							WHERE object_id = (OBJECT_ID(''' + @ObjectFullName + ''')) AND name = ''spid'')
-							ALTER TABLE ' + @ObjectFullName + N' ADD spid SMALLINT NULL;';
-						EXEC(@StringToExecute);
-
-						/* If the table doesn't have the new wait_resource column, add it. See Github #3101. */
-						SET @ObjectFullName = @OutputDatabaseName + N'.' + @OutputSchemaName + N'.' +  @OutputTableName;
-						SET @StringToExecute = N'IF NOT EXISTS (SELECT * FROM ' + @OutputDatabaseName + N'.sys.all_columns 
-							WHERE object_id = (OBJECT_ID(''' + @ObjectFullName + ''')) AND name = ''wait_resource'')
-							ALTER TABLE ' + @ObjectFullName + N' ADD wait_resource NVARCHAR(MAX) NULL;';
-						EXEC(@StringToExecute);
-					END
-					ELSE --if(@r is not null) --if it is null there is no table, create it from above execution
-					BEGIN
-						select @StringToExecute = N'use ' + @OutputDatabaseName + ';create table ' + @OutputSchemaName + '.' + @OutputTableName + ' (
-							ServerName NVARCHAR(256),
-							deadlock_type NVARCHAR(256),
-							event_date datetime,
-							database_name NVARCHAR(256),
-							spid SMALLINT,
-							deadlock_group NVARCHAR(256),
-							query XML,
-							object_names XML,
-							isolation_level NVARCHAR(256),
-							owner_mode NVARCHAR(256),
-							waiter_mode NVARCHAR(256),
-							transaction_count bigint,
-							login_name NVARCHAR(256),
-							host_name NVARCHAR(256),
-							client_app NVARCHAR(256),
-							wait_time BIGINT,
-							wait_resource NVARCHAR(max),
-							priority smallint,
-							log_used BIGINT,
-							last_tran_started datetime,
-							last_batch_started datetime,
-							last_batch_completed datetime,
-							transaction_name NVARCHAR(256),
-							owner_waiter_type NVARCHAR(256),
-							owner_activity NVARCHAR(256),
-							owner_waiter_activity NVARCHAR(256),
-							owner_merging NVARCHAR(256),
-							owner_spilling NVARCHAR(256),
-							owner_waiting_to_close NVARCHAR(256),
-							waiter_waiter_type NVARCHAR(256),
-							waiter_owner_activity NVARCHAR(256),
-							waiter_waiter_activity NVARCHAR(256),
-							waiter_merging NVARCHAR(256),
-							waiter_spilling NVARCHAR(256),
-							waiter_waiting_to_close NVARCHAR(256),
-							deadlock_graph XML)',
-							@StringToExecuteParams = N'@OutputDatabaseName NVARCHAR(200),@OutputSchemaName NVARCHAR(100),@OutputTableName NVARCHAR(200)'
-							exec sp_executesql @StringToExecute, @StringToExecuteParams,@OutputDatabaseName,@OutputSchemaName,@OutputTableName
-							--table created.
-							select @StringToExecute = N'select @r = name from ' + '' + @OutputDatabaseName + 
-								'' + '.sys.objects where type_desc=''USER_TABLE'' and name=''BlitzLockFindings''',
-							@StringToExecuteParams = N'@OutputDatabaseName NVARCHAR(200),@r NVARCHAR(200) OUTPUT'
-							exec sp_executesql @StringToExecute,@StringToExecuteParams,@OutputDatabaseName,@r OUTPUT
-							if(@r is null) --if table does not excist
-							BEGIN
-								select @OutputTableFindings=N'[BlitzLockFindings]',
-								@StringToExecute = N'use ' + @OutputDatabaseName + ';create table ' + @OutputSchemaName + '.' + @OutputTableFindings + ' (
-								ServerName NVARCHAR(256),
-								check_id INT, 
-								database_name NVARCHAR(256), 
-								object_name NVARCHAR(1000), 
-								finding_group NVARCHAR(100), 
-								finding NVARCHAR(4000))',
-								@StringToExecuteParams = N'@OutputDatabaseName NVARCHAR(200),@OutputSchemaName NVARCHAR(100),@OutputTableFindings NVARCHAR(200)'
-								exec sp_executesql @StringToExecute, @StringToExecuteParams, @OutputDatabaseName,@OutputSchemaName,@OutputTableFindings
-					
-							END
-
-					END
-							--create synonym for deadlockfindings.
-							if((select name from sys.objects where name='DeadlockFindings' and type_desc='SYNONYM')IS NOT NULL)
-							BEGIN
-								RAISERROR('found synonym', 0, 1) WITH NOWAIT;
-								drop synonym DeadlockFindings;
-							END
-							set @StringToExecute = 'CREATE SYNONYM DeadlockFindings FOR ' + @OutputDatabaseName + '.' + @OutputSchemaName + '.' + @OutputTableFindings; 
-							exec sp_executesql @StringToExecute
-							
-							--create synonym for deadlock table.
-							if((select name from sys.objects where name='DeadLockTbl' and type_desc='SYNONYM') IS NOT NULL)
-							BEGIN	
-								drop SYNONYM DeadLockTbl;
-							END
-							set @StringToExecute = 'CREATE SYNONYM DeadLockTbl FOR ' + @OutputDatabaseName + '.' + @OutputSchemaName + '.' + @OutputTableName; 
-							exec sp_executesql @StringToExecute
-					
-				END
-		END
-        
-
-        CREATE TABLE #t (id INT NOT NULL);
-
-		/* WITH ROWCOUNT doesn't work on Amazon RDS - see: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/2037 */
-		IF LEFT(CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS VARCHAR(8000)), 8) <> 'EC2AMAZ-'
-		   AND LEFT(CAST(SERVERPROPERTY('MachineName') AS VARCHAR(8000)), 8) <> 'EC2AMAZ-'
-		   AND db_id('rdsadmin') IS NULL
-		   BEGIN;
-				BEGIN TRY;
-					UPDATE STATISTICS #t WITH ROWCOUNT = 100000000, PAGECOUNT = 100000000;
-				END TRY
-				BEGIN CATCH;
-					/* Misleading error returned, if run without permissions to update statistics the error returned is "Cannot find object".
-					   Catching specific error, and returning message with better info. If any other error is returned, then throw as normal */
-					IF (ERROR_NUMBER() = 1088)
-					BEGIN;
-						SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-						RAISERROR('Cannot run UPDATE STATISTICS on temp table without db_owner or sysadmin permissions %s', 0, 1, @d) WITH NOWAIT;
-					END;
-					ELSE
-					BEGIN;
-						THROW;
-					END;
-				END CATCH;
-			END;
-
-		/*Grab the initial set of XML to parse*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Grab the initial set of XML to parse at %s', 0, 1, @d) WITH NOWAIT;
-        WITH xml
-        AS ( SELECT CONVERT(XML, event_data) AS deadlock_xml
-             FROM   sys.fn_xe_file_target_read_file(@EventSessionPath, NULL, NULL, NULL) )
-        SELECT ISNULL(xml.deadlock_xml, '') AS deadlock_xml
-        INTO   #deadlock_data
-        FROM   xml
-        LEFT JOIN #t AS t
-        ON 1 = 1
-        CROSS APPLY xml.deadlock_xml.nodes('/event/@name') AS x(c)
-        WHERE  1 = 1 
-        AND    x.c.exist('/event/@name[ .= "xml_deadlock_report"]') = 1
-        AND    CONVERT(datetime, SWITCHOFFSET(CONVERT(datetimeoffset, xml.deadlock_xml.value('(/event/@timestamp)[1]', 'datetime') ), DATENAME(TzOffset, SYSDATETIMEOFFSET())))  > @StartDate
-        AND    CONVERT(datetime, SWITCHOFFSET(CONVERT(datetimeoffset, xml.deadlock_xml.value('(/event/@timestamp)[1]', 'datetime') ), DATENAME(TzOffset, SYSDATETIMEOFFSET())))  < @EndDate
-		ORDER BY xml.deadlock_xml.value('(/event/@timestamp)[1]', 'datetime') DESC
-		OPTION ( RECOMPILE );
-
-		/*Optimization: if we got back more rows than @Top, remove them. This seems to be better than using @Top in the query above as that results in excessive memory grant*/
-		SET @DeadlockCount = @@ROWCOUNT
-		IF( @Top < @DeadlockCount ) BEGIN
-			WITH T
-			AS (
-				SELECT TOP ( @DeadlockCount - @Top) *
-				FROM   #deadlock_data
-				ORDER  BY #deadlock_data.deadlock_xml.value('(/event/@timestamp)[1]', 'datetime') ASC)
-			DELETE FROM T 
-		END
-
-		/*Parse process and input buffer XML*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse process and input buffer XML %s', 0, 1, @d) WITH NOWAIT;
-        SELECT      q.event_date,
-                    q.victim_id,
-					CONVERT(BIT, q.is_parallel) AS is_parallel,
-                    q.deadlock_graph,
-                    q.id,
-                    q.spid,
-                    q.database_id,
-                    q.priority,
-                    q.log_used,
-                    q.wait_resource,
-                    q.wait_time,
-                    q.transaction_name,
-                    q.last_tran_started,
-                    q.last_batch_started,
-                    q.last_batch_completed,
-                    q.lock_mode,
-                    q.transaction_count,
-                    q.client_app,
-                    q.host_name,
-                    q.login_name,
-                    q.isolation_level,
-                    q.process_xml,
-                    ISNULL(ca2.ib.query('.'), '') AS input_buffer
-        INTO        #deadlock_process
-        FROM        (   SELECT      dd.deadlock_xml,
-                                    CONVERT(DATETIME2(7), SWITCHOFFSET(CONVERT(datetimeoffset, dd.event_date ), DATENAME(TzOffset, SYSDATETIMEOFFSET()))) AS event_date,
-                                    dd.victim_id,
-									CONVERT(tinyint, dd.is_parallel) + CONVERT(tinyint, dd.is_parallel_batch) AS is_parallel,
-                                    dd.deadlock_graph,
-                                    ca.dp.value('@id', 'NVARCHAR(256)') AS id,
-									ca.dp.value('@spid', 'SMALLINT') AS spid,
-                                    ca.dp.value('@currentdb', 'BIGINT') AS database_id,
-                                    ca.dp.value('@priority', 'SMALLINT') AS priority,
-                                    ca.dp.value('@logused', 'BIGINT') AS log_used,
-                                    ca.dp.value('@waitresource', 'NVARCHAR(256)') AS wait_resource,
-                                    ca.dp.value('@waittime', 'BIGINT') AS wait_time,
-                                    ca.dp.value('@transactionname', 'NVARCHAR(256)') AS transaction_name,
-                                    ca.dp.value('@lasttranstarted', 'DATETIME2(7)') AS last_tran_started,
-                                    ca.dp.value('@lastbatchstarted', 'DATETIME2(7)') AS last_batch_started,
-                                    ca.dp.value('@lastbatchcompleted', 'DATETIME2(7)') AS last_batch_completed,
-                                    ca.dp.value('@lockMode', 'NVARCHAR(256)') AS lock_mode,
-                                    ca.dp.value('@trancount', 'BIGINT') AS transaction_count,
-                                    ca.dp.value('@clientapp', 'NVARCHAR(256)') AS client_app,
-                                    ca.dp.value('@hostname', 'NVARCHAR(256)') AS host_name,
-                                    ca.dp.value('@loginname', 'NVARCHAR(256)') AS login_name,
-                                    ca.dp.value('@isolationlevel', 'NVARCHAR(256)') AS isolation_level,
-                                    ISNULL(ca.dp.query('.'), '') AS process_xml
-                        FROM        (   SELECT d1.deadlock_xml,
-                                               d1.deadlock_xml.value('(event/@timestamp)[1]', 'DATETIME2') AS event_date,
-                                               d1.deadlock_xml.value('(//deadlock/victim-list/victimProcess/@id)[1]', 'NVARCHAR(256)') AS victim_id,
-											   d1.deadlock_xml.exist('//deadlock/resource-list/exchangeEvent') AS is_parallel,
-											   d1.deadlock_xml.exist('//deadlock/resource-list/SyncPoint') AS is_parallel_batch,
-                                               d1.deadlock_xml.query('/event/data/value/deadlock') AS deadlock_graph
-                                        FROM   #deadlock_data AS d1 ) AS dd
-                        CROSS APPLY dd.deadlock_xml.nodes('//deadlock/process-list/process') AS ca(dp)
-        WHERE (ca.dp.value('@currentdb', 'BIGINT') = DB_ID(@DatabaseName) OR @DatabaseName IS NULL) 
-        AND   (ca.dp.value('@clientapp', 'NVARCHAR(256)') = @AppName OR @AppName IS NULL) 
-        AND   (ca.dp.value('@hostname', 'NVARCHAR(256)') = @HostName OR @HostName IS NULL) 
-        AND   (ca.dp.value('@loginname', 'NVARCHAR(256)') = @LoginName OR @LoginName IS NULL) 
-        ) AS q
-        CROSS APPLY q.deadlock_xml.nodes('//deadlock/process-list/process/inputbuf') AS ca2(ib)
-		OPTION ( RECOMPILE );
-
-
-		/*Parse execution stack XML*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse execution stack XML %s', 0, 1, @d) WITH NOWAIT;
-        SELECT      DISTINCT 
-		            dp.id,
-					dp.event_date,
-                    ca.dp.value('@procname', 'NVARCHAR(1000)') AS proc_name,
-                    ca.dp.value('@sqlhandle', 'NVARCHAR(128)') AS sql_handle
-        INTO        #deadlock_stack
-        FROM        #deadlock_process AS dp
-        CROSS APPLY dp.process_xml.nodes('//executionStack/frame') AS ca(dp)
-		WHERE (ca.dp.value('@procname', 'NVARCHAR(256)') = @StoredProcName OR @StoredProcName IS NULL)
-		OPTION ( RECOMPILE );
-
-
-
-		/*Grab the full resource list*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Grab the full resource list %s', 0, 1, @d) WITH NOWAIT;
-        SELECT 
-                    CONVERT(DATETIME2(7), SWITCHOFFSET(CONVERT(datetimeoffset, dr.event_date), DATENAME(TzOffset, SYSDATETIMEOFFSET()))) AS event_date,
-                    dr.victim_id, 
-                    dr.resource_xml
-        INTO        #deadlock_resource
-        FROM 
+        IF NOT EXISTS
         (
-        SELECT      dd.deadlock_xml.value('(event/@timestamp)[1]', 'DATETIME2') AS event_date,
-					dd.deadlock_xml.value('(//deadlock/victim-list/victimProcess/@id)[1]', 'NVARCHAR(256)') AS victim_id,
-					ISNULL(ca.dp.query('.'), '') AS resource_xml
-        FROM        #deadlock_data AS dd
-        CROSS APPLY dd.deadlock_xml.nodes('//deadlock/resource-list') AS ca(dp)
-        ) AS dr
-		OPTION ( RECOMPILE );
+            SELECT
+                1/0
+            FROM sys.databases AS d
+            WHERE d.name = @OutputDatabaseName
+        ) /*If database is invalid raiserror and set bitcheck*/
+        BEGIN
+            RAISERROR('Database Name (%s) for output of table is invalid please, Output to Table will not be performed', 0, 1, @OutputDatabaseName) WITH NOWAIT;
+            SET @OutputDatabaseCheck = -1; /* -1 invalid/false, 0 = good/true */
+        END;
+        ELSE
+        BEGIN
+            SET @OutputDatabaseCheck = 0;
 
+            SELECT
+                @StringToExecute =
+                    N'SELECT @r = o.name FROM ' +
+                    @OutputDatabaseName +
+                    N'.sys.objects AS o WHERE o.type_desc = N''USER_TABLE'' AND o.name = ' +
+                    QUOTENAME
+                    (
+                        @OutputTableName,
+                        N''''
+                    ) +
+                    N' AND o.schema_id = SCHEMA_ID(' +
+                    QUOTENAME
+                    (
+                        @OutputSchemaName,
+                        N''''
+                    ) +
+                    N');',
+                @StringToExecuteParams =
+                    N'@r sysname OUTPUT';
 
-		/*Parse object locks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse object locks %s', 0, 1, @d) WITH NOWAIT;
-        SELECT      DISTINCT 
-		            ca.event_date,
-					ca.database_id,
-					ca.object_name,
-					ca.lock_mode,
-					ca.index_name,
-					ca.associatedObjectId,
-				    w.l.value('@id', 'NVARCHAR(256)') AS waiter_id,
-                    w.l.value('@mode', 'NVARCHAR(256)') AS waiter_mode,
-                    o.l.value('@id', 'NVARCHAR(256)') AS owner_id,
-                    o.l.value('@mode', 'NVARCHAR(256)') AS owner_mode,
-					N'OBJECT' AS lock_type
-        INTO        #deadlock_owner_waiter
-		FROM (
-        SELECT      dr.event_date,
-					ca.dr.value('@dbid', 'BIGINT') AS database_id,
-                    ca.dr.value('@objectname', 'NVARCHAR(256)') AS object_name,
-                    ca.dr.value('@mode', 'NVARCHAR(256)') AS lock_mode,
-					ca.dr.value('@indexname', 'NVARCHAR(256)') AS index_name,
-					ca.dr.value('@associatedObjectId', 'BIGINT') AS associatedObjectId,
-					ca.dr.query('.') AS dr
-        FROM        #deadlock_resource AS dr
-        CROSS APPLY dr.resource_xml.nodes('//resource-list/objectlock') AS ca(dr)
-		) AS ca
-        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
-        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
-		WHERE (ca.object_name = @ObjectName OR @ObjectName IS NULL)
-		OPTION ( RECOMPILE );
+            IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+            EXEC sys.sp_executesql
+                @StringToExecute,
+                @StringToExecuteParams,
+                @r OUTPUT;
 
-
-
-		/*Parse page locks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse page locks %s', 0, 1, @d) WITH NOWAIT;
-        INSERT #deadlock_owner_waiter WITH(TABLOCKX)
-        SELECT      DISTINCT 
-		            ca.event_date,
-					ca.database_id,
-					ca.object_name,
-					ca.lock_mode,
-					ca.index_name,
-					ca.associatedObjectId,
-				    w.l.value('@id', 'NVARCHAR(256)') AS waiter_id,
-                    w.l.value('@mode', 'NVARCHAR(256)') AS waiter_mode,
-                    o.l.value('@id', 'NVARCHAR(256)') AS owner_id,
-                    o.l.value('@mode', 'NVARCHAR(256)') AS owner_mode,
-					N'PAGE' AS lock_type
-		FROM (
-        SELECT      dr.event_date,
-					ca.dr.value('@dbid', 'BIGINT') AS database_id,
-                    ca.dr.value('@objectname', 'NVARCHAR(256)') AS object_name,
-                    ca.dr.value('@mode', 'NVARCHAR(256)') AS lock_mode,
-					ca.dr.value('@indexname', 'NVARCHAR(256)') AS index_name,
-					ca.dr.value('@associatedObjectId', 'BIGINT') AS associatedObjectId,
-					ca.dr.query('.') AS dr
-        FROM        #deadlock_resource AS dr
-        CROSS APPLY dr.resource_xml.nodes('//resource-list/pagelock') AS ca(dr)
-		) AS ca
-        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
-        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
-		OPTION ( RECOMPILE );
-
-
-		/*Parse key locks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse key locks %s', 0, 1, @d) WITH NOWAIT;
-        INSERT #deadlock_owner_waiter WITH(TABLOCKX) 
-        SELECT      DISTINCT 
-		            ca.event_date,
-					ca.database_id,
-					ca.object_name,
-					ca.lock_mode,
-					ca.index_name,
-					ca.associatedObjectId,
-				    w.l.value('@id', 'NVARCHAR(256)') AS waiter_id,
-                    w.l.value('@mode', 'NVARCHAR(256)') AS waiter_mode,
-                    o.l.value('@id', 'NVARCHAR(256)') AS owner_id,
-                    o.l.value('@mode', 'NVARCHAR(256)') AS owner_mode,
-					N'KEY' AS lock_type
-		FROM (
-        SELECT      dr.event_date,
-					ca.dr.value('@dbid', 'BIGINT') AS database_id,
-                    ca.dr.value('@objectname', 'NVARCHAR(256)') AS object_name,
-                    ca.dr.value('@mode', 'NVARCHAR(256)') AS lock_mode,
-					ca.dr.value('@indexname', 'NVARCHAR(256)') AS index_name,
-					ca.dr.value('@associatedObjectId', 'BIGINT') AS associatedObjectId,
-					ca.dr.query('.') AS dr
-        FROM        #deadlock_resource AS dr
-        CROSS APPLY dr.resource_xml.nodes('//resource-list/keylock') AS ca(dr)
-		) AS ca
-        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
-        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
-		OPTION ( RECOMPILE );
-
-
-		/*Parse RID locks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse RID locks %s', 0, 1, @d) WITH NOWAIT;
-        INSERT #deadlock_owner_waiter WITH(TABLOCKX)
-        SELECT      DISTINCT 
-		            ca.event_date,
-					ca.database_id,
-					ca.object_name,
-					ca.lock_mode,
-					ca.index_name,
-					ca.associatedObjectId,
-				    w.l.value('@id', 'NVARCHAR(256)') AS waiter_id,
-                    w.l.value('@mode', 'NVARCHAR(256)') AS waiter_mode,
-                    o.l.value('@id', 'NVARCHAR(256)') AS owner_id,
-                    o.l.value('@mode', 'NVARCHAR(256)') AS owner_mode,
-					N'RID' AS lock_type
-		FROM (
-        SELECT      dr.event_date,
-					ca.dr.value('@dbid', 'BIGINT') AS database_id,
-                    ca.dr.value('@objectname', 'NVARCHAR(256)') AS object_name,
-                    ca.dr.value('@mode', 'NVARCHAR(256)') AS lock_mode,
-					ca.dr.value('@indexname', 'NVARCHAR(256)') AS index_name,
-					ca.dr.value('@associatedObjectId', 'BIGINT') AS associatedObjectId,
-					ca.dr.query('.') AS dr
-        FROM        #deadlock_resource AS dr
-        CROSS APPLY dr.resource_xml.nodes('//resource-list/ridlock') AS ca(dr)
-		) AS ca
-        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
-        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
-		OPTION ( RECOMPILE );
-
-
-		/*Parse row group locks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse row group locks %s', 0, 1, @d) WITH NOWAIT;
-        INSERT #deadlock_owner_waiter WITH(TABLOCKX)
-        SELECT      DISTINCT 
-		            ca.event_date,
-					ca.database_id,
-					ca.object_name,
-					ca.lock_mode,
-					ca.index_name,
-					ca.associatedObjectId,
-				    w.l.value('@id', 'NVARCHAR(256)') AS waiter_id,
-                    w.l.value('@mode', 'NVARCHAR(256)') AS waiter_mode,
-                    o.l.value('@id', 'NVARCHAR(256)') AS owner_id,
-                    o.l.value('@mode', 'NVARCHAR(256)') AS owner_mode,
-					N'ROWGROUP' AS lock_type
-		FROM (
-        SELECT      dr.event_date,
-					ca.dr.value('@dbid', 'BIGINT') AS database_id,
-                    ca.dr.value('@objectname', 'NVARCHAR(256)') AS object_name,
-                    ca.dr.value('@mode', 'NVARCHAR(256)') AS lock_mode,
-					ca.dr.value('@indexname', 'NVARCHAR(256)') AS index_name,
-					ca.dr.value('@associatedObjectId', 'BIGINT') AS associatedObjectId,
-					ca.dr.query('.') AS dr
-        FROM        #deadlock_resource AS dr
-        CROSS APPLY dr.resource_xml.nodes('//resource-list/rowgrouplock') AS ca(dr)
-		) AS ca
-        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
-        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
-		OPTION ( RECOMPILE );
-
-		UPDATE d
-		    SET	d.index_name = d.object_name
-							   + '.HEAP'
-		FROM #deadlock_owner_waiter AS d
-		WHERE lock_type IN (N'HEAP', N'RID')
-		OPTION(RECOMPILE);
-
-		/*Parse parallel deadlocks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Parse parallel deadlocks %s', 0, 1, @d) WITH NOWAIT;
-        SELECT DISTINCT 
- 	          ca.id,
- 			  ca.event_date,
-			  ca.wait_type,
- 			  ca.node_id,
- 			  ca.waiter_type,
- 			  ca.owner_activity,
- 			  ca.waiter_activity,
- 			  ca.merging,
- 			  ca.spilling,
- 			  ca.waiting_to_close,
- 	   		  w.l.value('@id', 'NVARCHAR(256)') AS waiter_id,
-              o.l.value('@id', 'NVARCHAR(256)') AS owner_id
- 	   INTO #deadlock_resource_parallel
- 	   FROM (
-        SELECT		dr.event_date,
- 					ca.dr.value('@id', 'NVARCHAR(256)') AS id,
-                    ca.dr.value('@WaitType', 'NVARCHAR(256)') AS wait_type,
-                    ca.dr.value('@nodeId', 'BIGINT') AS node_id,
- 					/* These columns are in 2017 CU5 ONLY */
- 					ca.dr.value('@waiterType', 'NVARCHAR(256)') AS waiter_type,
- 					ca.dr.value('@ownerActivity', 'NVARCHAR(256)') AS owner_activity,
- 					ca.dr.value('@waiterActivity', 'NVARCHAR(256)') AS waiter_activity,
- 					ca.dr.value('@merging', 'NVARCHAR(256)') AS merging,
- 					ca.dr.value('@spilling', 'NVARCHAR(256)') AS spilling,
- 					ca.dr.value('@waitingToClose', 'NVARCHAR(256)') AS waiting_to_close,
-                     /*                                    */      
- 					ca.dr.query('.') AS dr
- 		FROM        #deadlock_resource AS dr
-         CROSS APPLY dr.resource_xml.nodes('//resource-list/exchangeEvent') AS ca(dr)
- 		) AS ca
-         CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
-         CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
- 		OPTION ( RECOMPILE );
-
-
-		/*Get rid of parallel noise*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Get rid of parallel noise %s', 0, 1, @d) WITH NOWAIT;
-		WITH c
-		    AS
-		     (
-		         SELECT *, ROW_NUMBER() OVER ( PARTITION BY drp.owner_id, drp.waiter_id ORDER BY drp.event_date ) AS rn
-		         FROM   #deadlock_resource_parallel AS drp
-		     )
-		DELETE FROM c
-		WHERE c.rn > 1
-		OPTION ( RECOMPILE );
-
-
-		/*Get rid of nonsense*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Get rid of nonsense %s', 0, 1, @d) WITH NOWAIT;
-		DELETE dow
-		FROM #deadlock_owner_waiter AS dow
-		WHERE dow.owner_id = dow.waiter_id
-		OPTION ( RECOMPILE );
-
-		/*Add some nonsense*/
-		ALTER TABLE #deadlock_process
-		ADD waiter_mode	NVARCHAR(256),
-			owner_mode NVARCHAR(256),
-			is_victim AS CONVERT(BIT, CASE WHEN id = victim_id THEN 1 ELSE 0 END);
-
-		/*Update some nonsense*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Update some nonsense part 1 %s', 0, 1, @d) WITH NOWAIT;
-		UPDATE dp
-		SET dp.owner_mode = dow.owner_mode
-		FROM #deadlock_process AS dp
-		JOIN #deadlock_owner_waiter AS dow
-		ON dp.id = dow.owner_id
-		AND dp.event_date = dow.event_date
-		WHERE dp.is_victim = 0
-		OPTION ( RECOMPILE );
-
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Update some nonsense part 2 %s', 0, 1, @d) WITH NOWAIT;
-		UPDATE dp
-		SET dp.waiter_mode = dow.waiter_mode
-		FROM #deadlock_process AS dp
-		JOIN #deadlock_owner_waiter AS dow
-		ON dp.victim_id = dow.waiter_id
-		AND dp.event_date = dow.event_date
-		WHERE dp.is_victim = 1
-		OPTION ( RECOMPILE );
-
-		/*Get Agent Job and Step names*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Get Agent Job and Step names %s', 0, 1, @d) WITH NOWAIT;
-        SELECT *,
-               CONVERT(UNIQUEIDENTIFIER, 
-                           CONVERT(XML, '').value('xs:hexBinary(substring(sql:column("x.job_id"), 0) )', 'BINARY(16)')
-                      ) AS job_id_guid
-        INTO #agent_job
-        FROM (
-            SELECT dp.event_date,
-                   dp.victim_id,
-                   dp.id,
-                   dp.database_id,
-                   dp.client_app,
-                   SUBSTRING(dp.client_app, 
-                             CHARINDEX('0x', dp.client_app) + LEN('0x'), 
-                             32
-                             ) AS job_id,
-		    	   SUBSTRING(dp.client_app, 
-                             CHARINDEX(': Step ', dp.client_app) + LEN(': Step '), 
-                             CHARINDEX(')', dp.client_app, CHARINDEX(': Step ', dp.client_app)) 
-                                 - (CHARINDEX(': Step ', dp.client_app) 
-                                     + LEN(': Step '))
-                             ) AS step_id
-            FROM #deadlock_process AS dp
-            WHERE dp.client_app LIKE 'SQLAgent - %'
-			AND   dp.client_app <> 'SQLAgent - Initial Boot Probe'
-        ) AS x
-		OPTION ( RECOMPILE );
-
-
-        ALTER TABLE #agent_job ADD job_name NVARCHAR(256),
-                                   step_name NVARCHAR(256);
-
-        IF SERVERPROPERTY('EngineEdition') NOT IN (5, 6) /* Azure SQL DB doesn't support querying jobs */
-		  AND NOT (LEFT(CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS VARCHAR(8000)), 8) = 'EC2AMAZ-'   /* Neither does Amazon RDS Express Edition */
-					AND LEFT(CAST(SERVERPROPERTY('MachineName') AS VARCHAR(8000)), 8) = 'EC2AMAZ-'
-					AND db_id('rdsadmin') IS NOT NULL
-					AND EXISTS(SELECT * FROM master.sys.all_objects WHERE name IN ('rds_startup_tasks', 'rds_help_revlogin', 'rds_hexadecimal', 'rds_failover_tracking', 'rds_database_tracking', 'rds_track_change'))
-		   		)
+            IF @Debug = 1
             BEGIN
-            SET @StringToExecute = N'UPDATE aj
-                    SET  aj.job_name = j.name, 
-                         aj.step_name = s.step_name
-		            FROM msdb.dbo.sysjobs AS j
-		            JOIN msdb.dbo.sysjobsteps AS s 
-                        ON j.job_id = s.job_id
-                    JOIN #agent_job AS aj
-                        ON  aj.job_id_guid = j.job_id
-                        AND aj.step_id = s.step_id
-						OPTION ( RECOMPILE );';
-            EXEC(@StringToExecute);
-            END
+                RAISERROR('@r is set to: %s for schema name %s  and table name %s', 0, 1, @r, @OutputSchemaName, @OutputTableName) WITH NOWAIT;
+            END;
 
-        UPDATE dp
-           SET dp.client_app = 
-               CASE WHEN dp.client_app LIKE N'SQLAgent - %'
-                    THEN N'SQLAgent - Job: ' 
-                         + aj.job_name
-                         + N' Step: '
-                         + aj.step_name
+            /*protection spells*/
+            SELECT
+                @ObjectFullName =
+                    QUOTENAME(@OutputDatabaseName) +
+                    N'.' +
+                    QUOTENAME(@OutputSchemaName) +
+                    N'.' +
+                    QUOTENAME(@OutputTableName),
+                @OutputDatabaseName =
+                    QUOTENAME(@OutputDatabaseName),
+                @OutputTableName =
+                    QUOTENAME(@OutputTableName),
+                @OutputSchemaName =
+                    QUOTENAME(@OutputSchemaName);
+
+            IF (@r IS NOT NULL) /*if it is not null, there is a table, so check for newly added columns*/
+            BEGIN
+                /* If the table doesn't have the new spid column, add it. See Github #3101. */
+                SET @StringToExecute =
+                        N'IF NOT EXISTS (SELECT 1/0 FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
+                        @ObjectFullName +
+                        N''')) AND o.name = N''spid'')
+                        /*Add spid column*/
+                        ALTER TABLE ' +
+                        @ObjectFullName +
+                        N' ADD spid smallint NULL;';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+
+                /* If the table doesn't have the new wait_resource column, add it. See Github #3101. */
+                SET @StringToExecute =
+                        N'IF NOT EXISTS (SELECT 1/0 FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
+                        @ObjectFullName +
+                        N''')) AND o.name = N''wait_resource'')
+                        /*Add wait_resource column*/
+                        ALTER TABLE ' +
+                        @ObjectFullName +
+                        N' ADD wait_resource nvarchar(MAX) NULL;';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+
+                /* If the table doesn't have the new client option column, add it. See Github #3101. */
+                SET @StringToExecute =
+                        N'IF NOT EXISTS (SELECT 1/0 FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
+                        @ObjectFullName +
+                        N''')) AND o.name = N''client_option_1'')
+                        /*Add wait_resource column*/
+                        ALTER TABLE ' +
+                        @ObjectFullName +
+                        N' ADD client_option_1 nvarchar(8000) NULL;';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+
+                /* If the table doesn't have the new client option column, add it. See Github #3101. */
+                SET @StringToExecute =
+                        N'IF NOT EXISTS (SELECT 1/0 FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
+                        @ObjectFullName +
+                        N''')) AND o.name = N''client_option_2'')
+                        /*Add wait_resource column*/
+                        ALTER TABLE ' +
+                        @ObjectFullName +
+                        N' ADD client_option_2 nvarchar(8000) NULL;';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+
+                /* If the table doesn't have the new lock mode column, add it. See Github #3101. */
+                SET @StringToExecute =
+                        N'IF NOT EXISTS (SELECT 1/0 FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
+                        @ObjectFullName +
+                        N''')) AND o.name = N''lock_mode'')
+                        /*Add wait_resource column*/
+                        ALTER TABLE ' +
+                        @ObjectFullName +
+                        N' ADD lock_mode nvarchar(256) NULL;';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+
+                /* If the table doesn't have the new status column, add it. See Github #3101. */
+                SET @StringToExecute =
+                        N'IF NOT EXISTS (SELECT 1/0 FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
+                        @ObjectFullName +
+                        N''')) AND o.name = N''status'')
+                        /*Add wait_resource column*/
+                        ALTER TABLE ' +
+                        @ObjectFullName +
+                        N' ADD status nvarchar(256) NULL;';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+            END;
+            ELSE /* end if @r is not null. if it is null there is no table, create it from above execution */
+            BEGIN
+                SELECT
+                    @StringToExecute =
+                        N'USE ' +
+                        @OutputDatabaseName +
+                        N';
+                        CREATE TABLE ' +
+                        @OutputSchemaName +
+                        N'.' +
+                        @OutputTableName +
+                        N'  (
+                                ServerName nvarchar(256),
+                                deadlock_type nvarchar(256),
+                                event_date datetime,
+                                database_name nvarchar(256),
+                                spid smallint,
+                                deadlock_group nvarchar(256),
+                                query xml,
+                                object_names xml,
+                                isolation_level nvarchar(256),
+                                owner_mode nvarchar(256),
+                                waiter_mode nvarchar(256),
+                                lock_mode nvarchar(256),
+                                transaction_count bigint,
+                                client_option_1 varchar(2000),
+                                client_option_2 varchar(2000),
+                                login_name nvarchar(256),
+                                host_name nvarchar(256),
+                                client_app nvarchar(1024),
+                                wait_time bigint,
+                                wait_resource nvarchar(max),
+                                priority smallint,
+                                log_used bigint,
+                                last_tran_started datetime,
+                                last_batch_started datetime,
+                                last_batch_completed datetime,
+                                transaction_name nvarchar(256),
+                                status nvarchar(256),
+                                owner_waiter_type nvarchar(256),
+                                owner_activity nvarchar(256),
+                                owner_waiter_activity nvarchar(256),
+                                owner_merging nvarchar(256),
+                                owner_spilling nvarchar(256),
+                                owner_waiting_to_close nvarchar(256),
+                                waiter_waiter_type nvarchar(256),
+                                waiter_owner_activity nvarchar(256),
+                                waiter_waiter_activity nvarchar(256),
+                                waiter_merging nvarchar(256),
+                                waiter_spilling nvarchar(256),
+                                waiter_waiting_to_close nvarchar(256),
+                                deadlock_graph xml
+                            )';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute;
+
+                /*table created.*/
+                SELECT
+                    @StringToExecute =
+                        N'SELECT @r = o.name FROM ' +
+                        @OutputDatabaseName +
+                        N'.sys.objects AS o
+                          WHERE o.type_desc = N''USER_TABLE''
+                          AND o.name = N''BlitzLockFindings''',
+                    @StringToExecuteParams =
+                        N'@r sysname OUTPUT';
+
+                IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                EXEC sys.sp_executesql
+                    @StringToExecute,
+                    @StringToExecuteParams,
+                    @r OUTPUT;
+
+                IF (@r IS NULL) /*if table does not exist*/
+                BEGIN
+                    SELECT
+                        @OutputTableFindings =
+                            QUOTENAME(N'BlitzLockFindings'),
+                        @StringToExecute =
+                            N'USE ' +
+                            @OutputDatabaseName +
+                            N';
+                            CREATE TABLE ' +
+                            @OutputSchemaName +
+                            N'.' +
+                            @OutputTableFindings +
+                            N' (
+                                   ServerName nvarchar(256),
+                                   check_id INT,
+                                   database_name nvarchar(256),
+                                   object_name nvarchar(1000),
+                                   finding_group nvarchar(100),
+                                   finding nvarchar(4000)
+                               );';
+
+                    IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+                    EXEC sys.sp_executesql
+                        @StringToExecute;
+                END;
+            END;
+
+            /*create synonym for deadlockfindings.*/
+            IF EXISTS
+            (
+                SELECT
+                    1/0
+                FROM sys.objects AS o
+                WHERE o.name = N'DeadlockFindings'
+                AND   o.type_desc = N'SYNONYM'
+            )
+            BEGIN
+                RAISERROR('Found synonym DeadlockFindings, dropping', 0, 1) WITH NOWAIT;
+                DROP SYNONYM DeadlockFindings;
+            END;
+
+            RAISERROR('Creating synonym DeadlockFindings', 0, 1) WITH NOWAIT;
+            SET @StringToExecute =
+                    N'CREATE SYNONYM DeadlockFindings FOR ' +
+                    @OutputDatabaseName +
+                    N'.' +
+                    @OutputSchemaName +
+                    N'.' +
+                    @OutputTableFindings;
+
+            IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+            EXEC sys.sp_executesql
+                @StringToExecute;
+
+            /*create synonym for deadlock table.*/
+            IF EXISTS
+            (
+                SELECT
+                    1/0
+                FROM sys.objects AS o
+                WHERE o.name = N'DeadLockTbl'
+                AND   o.type_desc = N'SYNONYM'
+            )
+            BEGIN
+                RAISERROR('Found synonym DeadLockTbl, dropping', 0, 1) WITH NOWAIT;
+                DROP SYNONYM DeadLockTbl;
+            END;
+
+            RAISERROR('Creating synonym DeadLockTbl', 0, 1) WITH NOWAIT;
+            SET @StringToExecute =
+                    N'CREATE SYNONYM DeadLockTbl FOR ' +
+                    @OutputDatabaseName +
+                    N'.' +
+                    @OutputSchemaName +
+                    N'.' +
+                    @OutputTableName;
+
+            IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+            EXEC sys.sp_executesql
+                @StringToExecute;
+        END;
+    END;
+
+    /* WITH ROWCOUNT doesn't work on Amazon RDS - see: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/2037 */
+    IF @RDS = 0
+    BEGIN;
+        BEGIN TRY;
+        RAISERROR('@RDS = 0, updating #t with high row and page counts', 0, 1) WITH NOWAIT;
+            UPDATE STATISTICS
+                #t
+            WITH
+                ROWCOUNT  = 9223372036854775807,
+                PAGECOUNT = 9223372036854775807;
+        END TRY
+        BEGIN CATCH;
+            /* Misleading error returned, if run without permissions to update statistics the error returned is "Cannot find object".
+                    Catching specific error, and returning message with better info. If any other error is returned, then throw as normal */
+            IF (ERROR_NUMBER() = 1088)
+            BEGIN;
+                SET @d = CONVERT(varchar(40), GETDATE(), 109);
+                RAISERROR('Cannot run UPDATE STATISTICS on a #temp table without db_owner or sysadmin permissions', 0, 1) WITH NOWAIT;
+            END;
+            ELSE
+            BEGIN;
+                THROW;
+            END;
+        END CATCH;
+    END;
+
+    /*If @TargetSessionType, we need to figure out if it's ring buffer or event file*/
+    /*Azure has differently named views, so  we need to separate. Thanks, Azure.*/
+
+        IF
+        (
+                @Azure = 0
+            AND @TargetSessionType IS NULL
+        )
+        BEGIN
+        RAISERROR('@TargetSessionType is NULL, assigning for non-Azure instance', 0, 1) WITH NOWAIT;
+
+            SELECT TOP (1)
+                @TargetSessionType = t.target_name
+            FROM sys.dm_xe_sessions AS s
+            JOIN sys.dm_xe_session_targets AS t
+              ON s.address = t.event_session_address
+            WHERE s.name = @EventSessionName
+            AND   t.target_name IN (N'event_file', N'ring_buffer')
+            ORDER BY t.target_name
+            OPTION(RECOMPILE);
+
+        RAISERROR('@TargetSessionType assigned as %s for non-Azure', 0, 1, @TargetSessionType) WITH NOWAIT;
+        END;
+
+        IF
+        (
+                @Azure = 1
+            AND @TargetSessionType IS NULL
+        )
+        BEGIN
+        RAISERROR('@TargetSessionType is NULL, assigning for Azure instance', 0, 1) WITH NOWAIT;
+
+            SELECT TOP (1)
+                @TargetSessionType = t.target_name
+            FROM sys.dm_xe_database_sessions AS s
+            JOIN sys.dm_xe_database_session_targets AS t
+              ON s.address = t.event_session_address
+            WHERE s.name = @EventSessionName
+            AND   t.target_name IN (N'event_file', N'ring_buffer')
+            ORDER BY t.target_name
+            OPTION(RECOMPILE);
+
+        RAISERROR('@TargetSessionType assigned as %s for Azure', 0, 1, @TargetSessionType) WITH NOWAIT;
+        END;
+
+
+    /*The system health stuff gets handled different from user extended events.*/
+    /*These next sections deal with user events, dependent on target.*/
+
+    /*If ring buffers*/
+    IF
+    (
+           @TargetSessionType LIKE N'ring%'
+       AND @EventSessionName NOT LIKE N'system_health%'
+    )
+    BEGIN
+        IF @Azure = 0
+        BEGIN
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('@TargetSessionType is ring_buffer, inserting XML for non-Azure at %s', 0, 1, @d) WITH NOWAIT;
+
+            INSERT
+                #x WITH(TABLOCKX)
+            (
+                x
+            )
+            SELECT
+                x = TRY_CAST(t.target_data AS xml)
+            FROM sys.dm_xe_session_targets AS t
+            JOIN sys.dm_xe_sessions AS s
+              ON s.address = t.event_session_address
+            WHERE s.name = @EventSessionName
+            AND   t.target_name = N'ring_buffer'
+            OPTION(RECOMPILE);
+
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+        END;
+
+        IF @Azure = 1
+        BEGIN
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('@TargetSessionType is ring_buffer, inserting XML for Azure at %s', 0, 1, @d) WITH NOWAIT;
+
+            INSERT
+                #x WITH(TABLOCKX)
+            (
+                x
+            )
+            SELECT
+                x = TRY_CAST(t.target_data AS xml)
+            FROM sys.dm_xe_database_session_targets AS t
+            JOIN sys.dm_xe_database_sessions AS s
+              ON s.address = t.event_session_address
+            WHERE s.name = @EventSessionName
+            AND   t.target_name = N'ring_buffer'
+            OPTION(RECOMPILE);
+
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+        END;
+    END;
+
+
+    /*If event file*/
+    IF
+    (
+           @TargetSessionType LIKE N'event%'
+       AND @EventSessionName NOT LIKE N'system_health%'
+    )
+    BEGIN
+        IF @Azure = 0
+        BEGIN
+            RAISERROR('@TargetSessionType is event_file, assigning XML for non-Azure', 0, 1) WITH NOWAIT;
+
+            SELECT
+                @SessionId = t.event_session_id,
+                @TargetSessionId = t.target_id
+            FROM sys.server_event_session_targets AS t
+            JOIN sys.server_event_sessions AS s
+              ON s.event_session_id = t.event_session_id
+            WHERE t.name = @TargetSessionType
+            AND   s.name = @EventSessionName
+            OPTION(RECOMPILE);
+
+            /*We get the file name automatically, here*/
+            RAISERROR('Assigning @FileName...', 0, 1) WITH NOWAIT;
+            SELECT
+                @FileName =
+                    CASE
+                        WHEN f.file_name LIKE N'%.xel'
+                        THEN REPLACE(f.file_name, N'.xel', N'*.xel')
+                        ELSE f.file_name + N'*.xel'
+                    END
+            FROM
+            (
+                SELECT
+                    file_name =
+                        CONVERT(nvarchar(4000), f.value)
+                FROM sys.server_event_session_fields AS f
+                WHERE f.event_session_id = @SessionId
+                AND   f.object_id = @TargetSessionId
+                AND   f.name = N'filename'
+            ) AS f
+            OPTION(RECOMPILE);
+        END;
+
+        IF @Azure = 1
+        BEGIN
+            RAISERROR('@TargetSessionType is event_file, assigning XML for Azure', 0, 1) WITH NOWAIT;
+            SELECT
+                @SessionId =
+                    t.event_session_address,
+                @TargetSessionId =
+                    t.target_name
+            FROM sys.dm_xe_database_session_targets t
+            JOIN sys.dm_xe_database_sessions s
+              ON s.address = t.event_session_address
+            WHERE t.target_name = @TargetSessionType
+            AND   s.name = @EventSessionName
+            OPTION(RECOMPILE);
+
+            /*We get the file name automatically, here*/
+            RAISERROR('Assigning @FileName...', 0, 1) WITH NOWAIT;
+            SELECT
+                @FileName =
+                    CASE
+                        WHEN f.file_name LIKE N'%.xel'
+                        THEN REPLACE(f.file_name, N'.xel', N'*.xel')
+                        ELSE f.file_name + N'*.xel'
+                    END
+            FROM
+            (
+                SELECT
+                    file_name =
+                        CONVERT(nvarchar(4000), f.value)
+                FROM sys.server_event_session_fields AS f
+                WHERE f.event_session_id = @SessionId
+                AND   f.object_id = @TargetSessionId
+                AND   f.name = N'filename'
+            ) AS f
+            OPTION(RECOMPILE);
+        END;
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Reading for event_file %s', 0, 1, @FileName) WITH NOWAIT;
+
+        INSERT
+            #x WITH(TABLOCKX)
+        (
+            x
+        )
+        SELECT
+            x = TRY_CAST(f.event_data AS xml)
+        FROM sys.fn_xe_file_target_read_file(@FileName, NULL, NULL, NULL) AS f
+        LEFT JOIN #t AS t
+          ON 1 = 1
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+    END;
+
+    /*The XML is parsed differently if it comes from the event file or ring buffer*/
+
+    /*If ring buffers*/
+    IF
+    (
+           @TargetSessionType LIKE N'ring%'
+       AND @EventSessionName NOT LIKE N'system_health%'
+    )
+    BEGIN
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Inserting to #deadlock_data for ring buffer data', 0, 1) WITH NOWAIT;
+
+        INSERT
+            #deadlock_data WITH(TABLOCKX)
+        (
+            deadlock_xml
+        )
+        SELECT
+            deadlock_xml =
+                e.x.query(N'.')
+        FROM #x AS x
+        LEFT JOIN #t AS t
+          ON 1 = 1
+        CROSS APPLY x.x.nodes('/RingBufferTarget/event') AS e(x)
+        WHERE e.x.exist('@name[ .= "xml_deadlock_report"]') = 1
+        AND   e.x.exist('@timestamp[. >= sql:variable("@StartDate")]') = 1
+        AND   e.x.exist('@timestamp[. <  sql:variable("@EndDate")]') = 1
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+    END;
+
+    /*If event file*/
+    IF
+    (
+           @TargetSessionType LIKE N'event_file%'
+       AND @EventSessionName NOT LIKE N'system_health%'
+    )
+    BEGIN
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Inserting to #deadlock_data for event file data', 0, 1) WITH NOWAIT;
+
+        INSERT
+            #deadlock_data WITH(TABLOCKX)
+        (
+            deadlock_xml
+        )
+        SELECT
+            deadlock_xml =
+                e.x.query('.')
+        FROM #x AS x
+        LEFT JOIN #t AS t
+          ON 1 = 1
+        CROSS APPLY x.x.nodes('/event') AS e(x)
+        WHERE e.x.exist('/event/@name[ .= "xml_deadlock_report"]') = 1
+        AND   e.x.exist('/event/@timestamp[. >= sql:variable("@StartDate")]') = 1
+        AND   e.x.exist('/event/@timestamp[. <  sql:variable("@EndDate")]') = 1
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+    END;
+
+    /*This section deals with event file*/
+    IF
+    (
+           @TargetSessionType LIKE N'event%'
+       AND @EventSessionName LIKE N'system_health%'
+    )
+    BEGIN
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Grab the initial set of xml to parse at %s', 0, 1, @d) WITH NOWAIT;
+
+        IF @Debug = 1 BEGIN SET STATISTICS XML ON; END;
+
+        SELECT
+            xml.deadlock_xml
+        INTO #xml
+        FROM
+        (
+            SELECT
+                deadlock_xml =
+                    TRY_CAST(fx.event_data AS xml)
+            FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL) AS fx
+            LEFT JOIN #t AS t
+              ON 1 = 1
+        ) AS xml
+        CROSS APPLY xml.deadlock_xml.nodes('/event') AS e(x)
+        WHERE e.x.exist('@name[ . = "xml_deadlock_report"]') = 1
+        AND   e.x.exist('@timestamp[. >= sql:variable("@StartDate")]') = 1
+        AND   e.x.exist('@timestamp[. <  sql:variable("@EndDate")]') = 1
+        OPTION(RECOMPILE);
+
+        INSERT
+            #deadlock_data WITH(TABLOCKX)
+        SELECT
+            deadlock_xml =
+                xml.deadlock_xml
+        FROM #xml AS xml
+        LEFT JOIN #t AS t
+          ON 1 = 1
+        WHERE xml.deadlock_xml IS NOT NULL
+        OPTION(RECOMPILE);
+
+        IF @Debug = 1 BEGIN SET STATISTICS XML OFF; END;
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+    END;
+
+        /*Parse process and input buffer xml*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Initial Parse process and input buffer xml %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT
+            d1.deadlock_xml,
+            event_date = d1.deadlock_xml.value('(event/@timestamp)[1]', 'datetime2'),
+            victim_id = d1.deadlock_xml.value('(//deadlock/victim-list/victimProcess/@id)[1]', 'nvarchar(256)'),
+            is_parallel = d1.deadlock_xml.exist('//deadlock/resource-list/exchangeEvent'),
+            is_parallel_batch = d1.deadlock_xml.exist('//deadlock/resource-list/SyncPoint'),
+            deadlock_graph = d1.deadlock_xml.query('/event/data/value/deadlock')
+        INTO #dd
+        FROM #deadlock_data AS d1
+        LEFT JOIN #t AS t
+          ON 1 = 1
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Final Parse process and input buffer xml %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT
+            q.event_date,
+            q.victim_id,
+            is_parallel =
+                CONVERT(bit, q.is_parallel),
+            q.deadlock_graph,
+            q.id,
+            q.spid,
+            q.database_id,
+            database_name =
+                ISNULL
+                (
+                    DB_NAME(q.database_id),
+                    N'UNKNOWN'
+                ),
+            q.current_database_name,
+            q.priority,
+            q.log_used,
+            q.wait_resource,
+            q.wait_time,
+            q.transaction_name,
+            q.last_tran_started,
+            q.last_batch_started,
+            q.last_batch_completed,
+            q.lock_mode,
+            q.status,
+            q.transaction_count,
+            q.client_app,
+            q.host_name,
+            q.login_name,
+            q.isolation_level,
+            client_option_1 =
+                SUBSTRING
+                (
+                    CASE WHEN q.clientoption1 & 1 = 1 THEN ', DISABLE_DEF_CNST_CHECK' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 2 = 2 THEN ', IMPLICIT_TRANSACTIONS' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 4 = 4 THEN ', CURSOR_CLOSE_ON_COMMIT' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 8 = 8 THEN ', ANSI_WARNINGS' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 16 = 16 THEN ', ANSI_PADDING' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 32 = 32 THEN ', ANSI_NULLS' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 64 = 64 THEN ', ARITHABORT' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 128 = 128 THEN ', ARITHIGNORE' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 256 = 256 THEN ', QUOTED_IDENTIFIER' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 512 = 512 THEN ', NOCOUNT' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 1024 = 1024 THEN ', ANSI_NULL_DFLT_ON' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 2048 = 2048 THEN ', ANSI_NULL_DFLT_OFF' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 4096 = 4096 THEN ', CONCAT_NULL_YIELDS_NULL' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 8192 = 8192 THEN ', NUMERIC_ROUNDABORT' ELSE '' END +
+                    CASE WHEN q.clientoption1 & 16384 = 16384 THEN ', XACT_ABORT' ELSE '' END,
+                    3,
+                    8000
+                ),
+            client_option_2 =
+                SUBSTRING
+                (
+                    CASE WHEN q.clientoption2 & 1024 = 1024 THEN ', DB CHAINING' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 2048 = 2048 THEN ', NUMERIC ROUNDABORT' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 4096 = 4096 THEN ', ARITHABORT' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 8192 = 8192 THEN ', ANSI PADDING' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 16384 = 16384 THEN ', ANSI NULL DEFAULT' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 65536 = 65536 THEN ', CONCAT NULL YIELDS NULL' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 131072 = 131072 THEN ', RECURSIVE TRIGGERS' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 1048576 = 1048576 THEN ', DEFAULT TO LOCAL CURSOR' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 8388608 = 8388608 THEN ', QUOTED IDENTIFIER' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 16777216 = 16777216 THEN ', AUTO CREATE STATISTICS' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 33554432 = 33554432 THEN ', CURSOR CLOSE ON COMMIT' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 67108864 = 67108864 THEN ', ANSI NULLS' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 268435456 = 268435456 THEN ', ANSI WARNINGS' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 536870912 = 536870912 THEN ', FULL TEXT ENABLED' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 1073741824 = 1073741824 THEN ', AUTO UPDATE STATISTICS' ELSE '' END +
+                    CASE WHEN q.clientoption2 & 1469283328 = 1469283328 THEN ', ALL SETTABLE OPTIONS' ELSE '' END,
+                    3,
+                    8000
+                ),
+            q.process_xml
+        INTO #deadlock_process
+        FROM
+        (
+            SELECT
+                dd.deadlock_xml,
+                event_date =
+                    DATEADD
+                    (
+                        MINUTE,
+                        DATEDIFF(MINUTE, GETUTCDATE(), SYSDATETIME()),
+                        dd.event_date
+                    ),
+                dd.victim_id,
+                is_parallel =
+                    CONVERT(tinyint, dd.is_parallel) +
+                    CONVERT(tinyint, dd.is_parallel_batch),
+                dd.deadlock_graph,
+                id = ca.dp.value('@id', 'nvarchar(256)'),
+                spid = ca.dp.value('@spid', 'smallint'),
+                database_id = ca.dp.value('@currentdb', 'bigint'),
+                current_database_name = ca.dp.value('@currentdbname', 'nvarchar(256)'),
+                priority = ca.dp.value('@priority', 'smallint'),
+                log_used = ca.dp.value('@logused', 'bigint'),
+                wait_resource = ca.dp.value('@waitresource', 'nvarchar(256)'),
+                wait_time = ca.dp.value('@waittime', 'bigint'),
+                transaction_name = ca.dp.value('@transactionname', 'nvarchar(256)'),
+                last_tran_started = ca.dp.value('@lasttranstarted', 'datetime'),
+                last_batch_started = ca.dp.value('@lastbatchstarted', 'datetime'),
+                last_batch_completed = ca.dp.value('@lastbatchcompleted', 'datetime'),
+                lock_mode = ca.dp.value('@lockMode', 'nvarchar(256)'),
+                status = ca.dp.value('@status', 'nvarchar(256)'),
+                transaction_count = ca.dp.value('@trancount', 'bigint'),
+                client_app = ca.dp.value('@clientapp', 'nvarchar(1024)'),
+                host_name = ca.dp.value('@hostname', 'nvarchar(256)'),
+                login_name = ca.dp.value('@loginname', 'nvarchar(256)'),
+                isolation_level = ca.dp.value('@isolationlevel', 'nvarchar(256)'),
+                clientoption1 = ca.dp.value('@clientoption1', 'bigint'),
+                clientoption2 = ca.dp.value('@clientoption2', 'bigint'),
+                process_xml = ISNULL(ca.dp.query(N'.'), N'')
+            FROM #dd AS dd
+            CROSS APPLY dd.deadlock_xml.nodes('//deadlock/process-list/process') AS ca(dp)
+            WHERE (ca.dp.exist('@currentdb[. = sql:variable("@DatabaseId")]') = 1 OR @DatabaseName IS NULL)
+            AND   (ca.dp.exist('@clientapp[. = sql:variable("@AppName")]') = 1 OR @AppName IS NULL)
+            AND   (ca.dp.exist('@hostname[. = sql:variable("@HostName")]') = 1 OR @HostName IS NULL)
+            AND   (ca.dp.exist('@loginname[. = sql:variable("@LoginName")]') = 1 OR @LoginName IS NULL)
+        ) AS q
+        LEFT JOIN #t AS t
+          ON 1 = 1
+        OPTION(RECOMPILE);
+
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse execution stack xml*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse execution stack xml %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT DISTINCT
+            dp.id,
+            dp.event_date,
+            proc_name = ca.dp.value('@procname', 'nvarchar(1024)'),
+            sql_handle = ca.dp.value('@sqlhandle', 'nvarchar(131)')
+        INTO #deadlock_stack
+        FROM #deadlock_process AS dp
+        CROSS APPLY dp.process_xml.nodes('//executionStack/frame') AS ca(dp)
+        WHERE (ca.dp.exist('@procname[. = sql:variable("@StoredProcName")]') = 1 OR @StoredProcName IS NULL)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Grab the full resource list*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+
+        RAISERROR('Grab the full resource list %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT
+            event_date =
+                DATEADD
+                (
+                    MINUTE,
+                    DATEDIFF
+                    (
+                        MINUTE,
+                        GETUTCDATE(),
+                        SYSDATETIME()
+                    ),
+                    dr.event_date
+                ),
+            dr.victim_id,
+            dr.resource_xml
+        INTO
+            #deadlock_resource
+        FROM
+        (
+            SELECT
+                event_date = dd.deadlock_xml.value('(event/@timestamp)[1]', 'datetime2'),
+                victim_id = dd.deadlock_xml.value('(//deadlock/victim-list/victimProcess/@id)[1]', 'nvarchar(256)'),
+                resource_xml = ISNULL(ca.dp.query(N'.'), N'')
+            FROM #deadlock_data AS dd
+            CROSS APPLY dd.deadlock_xml.nodes('//deadlock/resource-list') AS ca(dp)
+        ) AS dr
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse object locks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse object locks %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT DISTINCT
+            ca.event_date,
+            ca.database_id,
+            database_name =
+                ISNULL
+                (
+                    DB_NAME(ca.database_id),
+                    N'UNKNOWN'
+                ),
+            object_name =
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    ca.object_name COLLATE Latin1_General_BIN2,
+                NCHAR(31), N'?'), NCHAR(30), N'?'), NCHAR(29), N'?'), NCHAR(28), N'?'), NCHAR(27), N'?'),
+                NCHAR(26), N'?'), NCHAR(25), N'?'), NCHAR(24), N'?'), NCHAR(23), N'?'), NCHAR(22), N'?'),
+                NCHAR(21), N'?'), NCHAR(20), N'?'), NCHAR(19), N'?'), NCHAR(18), N'?'), NCHAR(17), N'?'),
+                NCHAR(16), N'?'), NCHAR(15), N'?'), NCHAR(14), N'?'), NCHAR(12), N'?'), NCHAR(11), N'?'),
+                NCHAR(8),  N'?'), NCHAR(7), N'?'),  NCHAR(6), N'?'),  NCHAR(5), N'?'),  NCHAR(4), N'?'),
+                NCHAR(3),  N'?'), NCHAR(2), N'?'),  NCHAR(1), N'?'),  NCHAR(0), N'?'),
+            ca.lock_mode,
+            ca.index_name,
+            ca.associatedObjectId,
+            waiter_id = w.l.value('@id', 'nvarchar(256)'),
+            waiter_mode = w.l.value('@mode', 'nvarchar(256)'),
+            owner_id = o.l.value('@id', 'nvarchar(256)'),
+            owner_mode = o.l.value('@mode', 'nvarchar(256)'),
+            lock_type = CAST(N'OBJECT' AS NVARCHAR(100))
+        INTO #deadlock_owner_waiter
+        FROM
+        (
+            SELECT
+                dr.event_date,
+                database_id = ca.dr.value('@dbid', 'bigint'),
+                object_name = ca.dr.value('@objectname', 'nvarchar(1024)'),
+                lock_mode = ca.dr.value('@mode', 'nvarchar(256)'),
+                index_name = ca.dr.value('@indexname', 'nvarchar(256)'),
+                associatedObjectId = ca.dr.value('@associatedObjectId', 'bigint'),
+                dr = ca.dr.query('.')
+            FROM #deadlock_resource AS dr
+            CROSS APPLY dr.resource_xml.nodes('//resource-list/objectlock') AS ca(dr)
+            WHERE (ca.dr.exist('@objectname[. = sql:variable("@ObjectName")]') = 1 OR @ObjectName IS NULL)
+        ) AS ca
+        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
+        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse page locks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse page locks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_owner_waiter WITH(TABLOCKX)
+        SELECT DISTINCT
+            ca.event_date,
+            ca.database_id,
+            database_name =
+                ISNULL
+                (
+                    DB_NAME(ca.database_id),
+                    N'UNKNOWN'
+                ),
+            ca.object_name,
+            ca.lock_mode,
+            ca.index_name,
+            ca.associatedObjectId,
+            waiter_id = w.l.value('@id', 'nvarchar(256)'),
+            waiter_mode = w.l.value('@mode', 'nvarchar(256)'),
+            owner_id = o.l.value('@id', 'nvarchar(256)'),
+            owner_mode = o.l.value('@mode', 'nvarchar(256)'),
+            lock_type = N'PAGE'
+        FROM
+        (
+            SELECT
+                dr.event_date,
+                database_id = ca.dr.value('@dbid', 'bigint'),
+                object_name = ca.dr.value('@objectname', 'nvarchar(1024)'),
+                lock_mode = ca.dr.value('@mode', 'nvarchar(256)'),
+                index_name = ca.dr.value('@indexname', 'nvarchar(256)'),
+                associatedObjectId = ca.dr.value('@associatedObjectId', 'bigint'),
+                dr = ca.dr.query('.')
+            FROM #deadlock_resource AS dr
+            CROSS APPLY dr.resource_xml.nodes('//resource-list/pagelock') AS ca(dr)
+            WHERE (ca.dr.exist('@objectname[. = sql:variable("@ObjectName")]') = 1 OR @ObjectName IS NULL)
+        ) AS ca
+        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
+        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse key locks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse key locks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_owner_waiter WITH(TABLOCKX)
+        SELECT DISTINCT
+            ca.event_date,
+            ca.database_id,
+            database_name =
+                ISNULL
+                (
+                    DB_NAME(ca.database_id),
+                    N'UNKNOWN'
+                ),
+            ca.object_name,
+            ca.lock_mode,
+            ca.index_name,
+            ca.associatedObjectId,
+            waiter_id = w.l.value('@id', 'nvarchar(256)'),
+            waiter_mode = w.l.value('@mode', 'nvarchar(256)'),
+            owner_id = o.l.value('@id', 'nvarchar(256)'),
+            owner_mode = o.l.value('@mode', 'nvarchar(256)'),
+            lock_type = N'KEY'
+        FROM
+        (
+            SELECT
+                dr.event_date,
+                database_id = ca.dr.value('@dbid', 'bigint'),
+                object_name = ca.dr.value('@objectname', 'nvarchar(1024)'),
+                lock_mode = ca.dr.value('@mode', 'nvarchar(256)'),
+                index_name = ca.dr.value('@indexname', 'nvarchar(256)'),
+                associatedObjectId = ca.dr.value('@associatedObjectId', 'bigint'),
+                dr = ca.dr.query('.')
+            FROM #deadlock_resource AS dr
+            CROSS APPLY dr.resource_xml.nodes('//resource-list/keylock') AS ca(dr)
+            WHERE (ca.dr.exist('@objectname[. = sql:variable("@ObjectName")]') = 1 OR @ObjectName IS NULL)
+        ) AS ca
+        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
+        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse RID locks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse RID locks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_owner_waiter WITH(TABLOCKX)
+        SELECT DISTINCT
+            ca.event_date,
+            ca.database_id,
+            database_name =
+                ISNULL
+                (
+                    DB_NAME(ca.database_id),
+                    N'UNKNOWN'
+                ),
+            ca.object_name,
+            ca.lock_mode,
+            ca.index_name,
+            ca.associatedObjectId,
+            waiter_id = w.l.value('@id', 'nvarchar(256)'),
+            waiter_mode = w.l.value('@mode', 'nvarchar(256)'),
+            owner_id = o.l.value('@id', 'nvarchar(256)'),
+            owner_mode = o.l.value('@mode', 'nvarchar(256)'),
+            lock_type = N'RID'
+        FROM
+        (
+            SELECT
+                dr.event_date,
+                database_id = ca.dr.value('@dbid', 'bigint'),
+                object_name = ca.dr.value('@objectname', 'nvarchar(1024)'),
+                lock_mode = ca.dr.value('@mode', 'nvarchar(256)'),
+                index_name = ca.dr.value('@indexname', 'nvarchar(256)'),
+                associatedObjectId = ca.dr.value('@associatedObjectId', 'bigint'),
+                dr = ca.dr.query('.')
+            FROM #deadlock_resource AS dr
+            CROSS APPLY dr.resource_xml.nodes('//resource-list/ridlock') AS ca(dr)
+            WHERE (ca.dr.exist('@objectname[. = sql:variable("@ObjectName")]') = 1 OR @ObjectName IS NULL)
+        ) AS ca
+        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
+        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse row group locks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse row group locks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_owner_waiter WITH(TABLOCKX)
+        SELECT DISTINCT
+            ca.event_date,
+            ca.database_id,
+            database_name =
+                ISNULL
+                (
+                    DB_NAME(ca.database_id),
+                    N'UNKNOWN'
+                ),
+            ca.object_name,
+            ca.lock_mode,
+            ca.index_name,
+            ca.associatedObjectId,
+            waiter_id = w.l.value('@id', 'nvarchar(256)'),
+            waiter_mode = w.l.value('@mode', 'nvarchar(256)'),
+            owner_id = o.l.value('@id', 'nvarchar(256)'),
+            owner_mode = o.l.value('@mode', 'nvarchar(256)'),
+            lock_type = N'ROWGROUP'
+        FROM
+        (
+            SELECT
+                dr.event_date,
+                database_id = ca.dr.value('@dbid', 'bigint'),
+                object_name = ca.dr.value('@objectname', 'nvarchar(1024)'),
+                lock_mode = ca.dr.value('@mode', 'nvarchar(256)'),
+                index_name = ca.dr.value('@indexname', 'nvarchar(256)'),
+                associatedObjectId = ca.dr.value('@associatedObjectId', 'bigint'),
+                dr = ca.dr.query('.')
+            FROM #deadlock_resource AS dr
+            CROSS APPLY dr.resource_xml.nodes('//resource-list/rowgrouplock') AS ca(dr)
+            WHERE (ca.dr.exist('@objectname[. = sql:variable("@ObjectName")]') = 1 OR @ObjectName IS NULL)
+        ) AS ca
+        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
+        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Fixing heaps in #deadlock_owner_waiter %s', 0, 1, @d) WITH NOWAIT;
+
+        UPDATE
+            d
+        SET
+            d.index_name =
+                d.object_name + N'.HEAP'
+        FROM #deadlock_owner_waiter AS d
+        WHERE d.lock_type IN
+              (
+                  N'HEAP',
+                  N'RID'
+              )
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Parse parallel deadlocks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Parse parallel deadlocks %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT DISTINCT
+            ca.id,
+            ca.event_date,
+            ca.wait_type,
+            ca.node_id,
+            ca.waiter_type,
+            ca.owner_activity,
+            ca.waiter_activity,
+            ca.merging,
+            ca.spilling,
+            ca.waiting_to_close,
+            waiter_id = w.l.value('@id', 'nvarchar(256)'),
+            owner_id = o.l.value('@id', 'nvarchar(256)')
+        INTO #deadlock_resource_parallel
+        FROM
+        (
+            SELECT
+                dr.event_date,
+                id = ca.dr.value('@id', 'nvarchar(256)'),
+                wait_type = ca.dr.value('@WaitType', 'nvarchar(256)'),
+                node_id = ca.dr.value('@nodeId', 'bigint'),
+                /* These columns are in 2017 CU5+ ONLY */
+                waiter_type = ca.dr.value('@waiterType', 'nvarchar(256)'),
+                owner_activity = ca.dr.value('@ownerActivity', 'nvarchar(256)'),
+                waiter_activity = ca.dr.value('@waiterActivity', 'nvarchar(256)'),
+                merging = ca.dr.value('@merging', 'nvarchar(256)'),
+                spilling = ca.dr.value('@spilling', 'nvarchar(256)'),
+                waiting_to_close = ca.dr.value('@waitingToClose', 'nvarchar(256)'),
+                /* These columns are in 2017 CU5+ ONLY */
+                dr = ca.dr.query('.')
+            FROM #deadlock_resource AS dr
+            CROSS APPLY dr.resource_xml.nodes('//resource-list/exchangeEvent') AS ca(dr)
+        ) AS ca
+        CROSS APPLY ca.dr.nodes('//waiter-list/waiter') AS w(l)
+        CROSS APPLY ca.dr.nodes('//owner-list/owner') AS o(l)
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Get rid of parallel noise*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Get rid of parallel noise %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            c AS
+        (
+            SELECT
+                *,
+                rn =
+                    ROW_NUMBER() OVER
+                    (
+                        PARTITION BY
+                            drp.owner_id,
+                            drp.waiter_id
+                        ORDER BY
+                            drp.event_date
+                    )
+            FROM #deadlock_resource_parallel AS drp
+        )
+        DELETE
+        FROM c
+        WHERE c.rn > 1
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Get rid of nonsense*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Get rid of nonsense %s', 0, 1, @d) WITH NOWAIT;
+
+        DELETE dow
+        FROM #deadlock_owner_waiter AS dow
+        WHERE dow.owner_id = dow.waiter_id
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Add some nonsense*/
+        ALTER TABLE
+            #deadlock_process
+        ADD
+            waiter_mode nvarchar(256),
+            owner_mode nvarchar(256),
+            is_victim AS
+                CONVERT
+                (
+                    bit,
+                    CASE
+                        WHEN id = victim_id
+                        THEN 1
+                        ELSE 0
+                    END
+                ) PERSISTED;
+
+        /*Update some nonsense*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Update some nonsense part 1 %s', 0, 1, @d) WITH NOWAIT;
+
+        UPDATE
+            dp
+        SET
+            dp.owner_mode = dow.owner_mode
+        FROM #deadlock_process AS dp
+        JOIN #deadlock_owner_waiter AS dow
+          ON  dp.id = dow.owner_id
+          AND dp.event_date = dow.event_date
+        WHERE dp.is_victim = 0
+        OPTION(RECOMPILE);
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Update some nonsense part 2 %s', 0, 1, @d) WITH NOWAIT;
+
+        UPDATE
+            dp
+        SET
+            dp.waiter_mode = dow.waiter_mode
+        FROM #deadlock_process AS dp
+        JOIN #deadlock_owner_waiter AS dow
+          ON  dp.victim_id = dow.waiter_id
+          AND dp.event_date = dow.event_date
+        WHERE dp.is_victim = 1
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Get Agent Job and Step names*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Get Agent Job and Step names %s', 0, 1, @d) WITH NOWAIT;
+
+        SELECT
+            x.event_date,
+            x.victim_id,
+            x.id,
+            x.database_id,
+            x.client_app,
+            x.job_id,
+            x.step_id,
+            job_id_guid =
+                CONVERT
+                (
+                    uniqueidentifier,
+                    TRY_CAST
+                    (
+                        N''
+                        AS xml
+                    ).value('xs:hexBinary(substring(sql:column("x.job_id"), 0))', 'binary(16)')
+                )
+        INTO #agent_job
+        FROM
+        (
+            SELECT
+                dp.event_date,
+                dp.victim_id,
+                dp.id,
+                dp.database_id,
+                dp.client_app,
+                job_id =
+                    SUBSTRING
+                    (
+                        dp.client_app,
+                        CHARINDEX(N'0x', dp.client_app) + LEN(N'0x'),
+                        32
+                    ),
+                step_id =
+                    SUBSTRING
+                    (
+                        dp.client_app,
+                        CHARINDEX(N': Step ', dp.client_app) + LEN(N': Step '),
+                        CHARINDEX(N')', dp.client_app, CHARINDEX(N': Step ', dp.client_app)) -
+                          (CHARINDEX(N': Step ', dp.client_app) + LEN(N': Step '))
+                    )
+            FROM #deadlock_process AS dp
+            WHERE dp.client_app LIKE N'SQLAgent - %'
+            AND   dp.client_app <> N'SQLAgent - Initial Boot Probe'
+        ) AS x
+        OPTION(RECOMPILE);
+
+        ALTER TABLE
+            #agent_job
+        ADD
+            job_name nvarchar(256),
+            step_name nvarchar(256);
+
+        IF
+        (
+                @Azure = 0
+            AND @RDS = 0
+        )
+        BEGIN
+            SET @StringToExecute =
+                N'
+    UPDATE
+        aj
+    SET
+        aj.job_name = j.name,
+        aj.step_name = s.step_name
+    FROM msdb.dbo.sysjobs AS j
+    JOIN msdb.dbo.sysjobsteps AS s
+      ON j.job_id = s.job_id
+    JOIN #agent_job AS aj
+      ON  aj.job_id_guid = j.job_id
+      AND aj.step_id = s.step_id
+    OPTION(RECOMPILE);
+                 ';
+
+            IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+            EXEC sys.sp_executesql
+                @StringToExecute;
+
+        END;
+
+        UPDATE
+            dp
+        SET
+            dp.client_app =
+                CASE
+                    WHEN dp.client_app LIKE N'SQLAgent - %'
+                    THEN N'SQLAgent - Job: ' +
+                         aj.job_name +
+                         N' Step: ' +
+                         aj.step_name
                     ELSE dp.client_app
-               END  
+                END
         FROM #deadlock_process AS dp
         JOIN #agent_job AS aj
-        ON dp.event_date = aj.event_date
-        AND dp.victim_id = aj.victim_id
-        AND dp.id = aj.id
-		OPTION ( RECOMPILE );
+          ON  dp.event_date = aj.event_date
+          AND dp.victim_id = aj.victim_id
+          AND dp.id = aj.id
+        OPTION(RECOMPILE);
 
-		/*Get each and every table of all databases*/
-		DECLARE @sysAssObjId AS TABLE (database_id bigint, partition_id bigint, schema_name varchar(255), table_name varchar(255));
-		INSERT into @sysAssObjId EXECUTE sp_MSforeachdb
-		  N'USE [?];
-		    SELECT DB_ID() as database_id, p.partition_id, s.name as schema_name, t.name as table_name
-			FROM sys.partitions p
-			LEFT JOIN sys.tables t ON t.object_id = p.object_id 
-			LEFT JOIN sys.schemas s ON s.schema_id = t.schema_id 
-			WHERE s.name is not NULL AND t.name is not NULL';
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
+        /*Get each and every table of all databases*/
+        IF @Azure = 0
+        BEGIN
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Inserting to @sysAssObjId %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Begin checks based on parsed values*/
+        INSERT INTO
+            @sysAssObjId
+        (
+            database_id,
+            partition_id,
+            schema_name,
+            table_name
+        )
+        EXECUTE sys.sp_MSforeachdb
+            N'
+            SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-		/*Check 1 is deadlocks by database*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 1 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-        ( check_id, database_name, object_name, finding_group, finding ) 	
-		SELECT 1 AS check_id, 
-			   DB_NAME(dp.database_id) AS database_name, 
-			   '-' AS object_name,
-			   'Total database locks' AS finding_group,
-			   'This database had ' 
-				+ CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT dp.event_date)) 
-				+ ' deadlocks.'
-        FROM   #deadlock_process AS dp
-		WHERE 1 = 1
-		AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dp.client_app = @AppName OR @AppName IS NULL)
-		AND (dp.host_name = @HostName OR @HostName IS NULL)
-		AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-		GROUP BY DB_NAME(dp.database_id)
-		OPTION ( RECOMPILE );
+            USE [?];
 
-		/*Check 2 is deadlocks by object*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 2 objects %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 	
-		SELECT 2 AS check_id, 
-			   ISNULL(DB_NAME(dow.database_id), 'UNKNOWN') AS database_name, 
-			   ISNULL(dow.object_name, 'UNKNOWN') AS object_name,
-			   'Total object deadlocks' AS finding_group,
-			   'This object was involved in ' 
-				+ CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT dow.event_date))
-				+ ' deadlock(s).'
-        FROM   #deadlock_owner_waiter AS dow
-		WHERE 1 = 1
-		AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
-		GROUP BY DB_NAME(dow.database_id), dow.object_name
-		OPTION ( RECOMPILE );
+            IF EXISTS
+            (
+                SELECT
+                    1/0
+                FROM #deadlock_process AS dp
+                WHERE dp.database_id = DB_ID()
+            )
+            BEGIN
+                SELECT
+                    database_id =
+                        DB_ID(),
+                    p.partition_id,
+                    schema_name =
+                        s.name,
+                    table_name =
+                        t.name
+                FROM sys.partitions p
+                JOIN sys.tables t
+                  ON t.object_id = p.object_id
+                JOIN sys.schemas s
+                  ON s.schema_id = t.schema_id
+                WHERE s.name IS NOT NULL
+                AND   t.name IS NOT NULL
+                OPTION(RECOMPILE);
+            END;
+            ';
 
-		/*Check 2 continuation, number of locks per index*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 2 indexes %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 	
-		SELECT 2 AS check_id, 
-			   ISNULL(DB_NAME(dow.database_id), 'UNKNOWN') AS database_name, 
-			   dow.index_name AS index_name,
-			   'Total index deadlocks' AS finding_group,
-			   'This index was involved in ' 
-				+ CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT dow.event_date))
-				+ ' deadlock(s).'
-        FROM   #deadlock_owner_waiter AS dow
-		WHERE 1 = 1
-		AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
-		AND dow.lock_type NOT IN (N'HEAP', N'RID')
-		AND dow.index_name is not null
-		GROUP BY DB_NAME(dow.database_id), dow.index_name
-		OPTION ( RECOMPILE );
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+        END;
 
+        IF @Azure = 1
+        BEGIN
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Inserting to @sysAssObjId at %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Check 2 continuation, number of locks per heap*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 2 heaps %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 	
-		SELECT 2 AS check_id, 
-			   ISNULL(DB_NAME(dow.database_id), 'UNKNOWN') AS database_name, 
-			   dow.index_name AS index_name,
-			   'Total heap deadlocks' AS finding_group,
-			   'This heap was involved in ' 
-				+ CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT dow.event_date))
-				+ ' deadlock(s).'
-        FROM   #deadlock_owner_waiter AS dow
-		WHERE 1 = 1
-		AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
-		AND dow.lock_type IN (N'HEAP', N'RID')
-		GROUP BY DB_NAME(dow.database_id), dow.index_name
-		OPTION ( RECOMPILE );
-		
+            INSERT INTO
+                @sysAssObjId
+            (
+                database_id,
+                partition_id,
+                schema_name,
+                table_name
+            )
+            SELECT
+                database_id =
+                    DB_ID(),
+                p.partition_id,
+                schema_name =
+                    s.name,
+                table_name =
+                    t.name
+            FROM sys.partitions p
+            JOIN sys.tables t
+              ON t.object_id = p.object_id
+            JOIN sys.schemas s
+              ON s.schema_id = t.schema_id
+            WHERE s.name IS NOT NULL
+            AND   t.name IS NOT NULL
+            OPTION(RECOMPILE);
 
-		/*Check 3 looks for Serializable locking*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 3 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT 3 AS check_id,
-			   DB_NAME(dp.database_id) AS database_name,
-			   '-' AS object_name,
-			   'Serializable locking' AS finding_group,
-			   'This database has had ' + 
-			   CONVERT(NVARCHAR(20), COUNT_BIG(*)) +
-			   ' instances of serializable deadlocks.'
-			   AS finding
-		FROM #deadlock_process AS dp
-		WHERE dp.isolation_level LIKE 'serializable%'
-		AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dp.client_app = @AppName OR @AppName IS NULL)
-		AND (dp.host_name = @HostName OR @HostName IS NULL)
-		AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-		GROUP BY DB_NAME(dp.database_id)
-		OPTION ( RECOMPILE );
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+        END;
 
+        /*Begin checks based on parsed values*/
 
-		/*Check 4 looks for Repeatable Read locking*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 4 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT 4 AS check_id,
-			   DB_NAME(dp.database_id) AS database_name,
-			   '-' AS object_name,
-			   'Repeatable Read locking' AS finding_group,
-			   'This database has had ' + 
-			   CONVERT(NVARCHAR(20), COUNT_BIG(*)) +
-			   ' instances of repeatable read deadlocks.'
-			   AS finding
-		FROM #deadlock_process AS dp
-		WHERE dp.isolation_level LIKE 'repeatable read%'
-		AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dp.client_app = @AppName OR @AppName IS NULL)
-		AND (dp.host_name = @HostName OR @HostName IS NULL)
-		AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-		GROUP BY DB_NAME(dp.database_id)
-		OPTION ( RECOMPILE );
+        /*Check 1 is deadlocks by database*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 1  database deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 1,
+            dp.database_name,
+            object_name = N'-',
+            finding_group = N'Total Database Deadlocks',
+            finding =
+                N'This database had ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dp.event_date)
+                ) +
+                N' deadlocks.'
+        FROM #deadlock_process AS dp
+        WHERE 1 = 1
+        AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+        AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dp.client_app = @AppName OR @AppName IS NULL)
+        AND (dp.host_name = @HostName OR @HostName IS NULL)
+        AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        GROUP BY dp.database_name
+        OPTION(RECOMPILE);
 
-		/*Check 5 breaks down app, host, and login information*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 5 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT 5 AS check_id,
-			   DB_NAME(dp.database_id) AS database_name,
-			   '-' AS object_name,
-			   'Login, App, and Host locking' AS finding_group,
-			   'This database has had ' + 
-			   CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT dp.event_date)) +
-			   ' instances of deadlocks involving the login ' +
-			   ISNULL(dp.login_name, 'UNKNOWN') + 
-			   ' from the application ' + 
-			   ISNULL(dp.client_app, 'UNKNOWN') + 
-			   ' on host ' + 
-			   ISNULL(dp.host_name, 'UNKNOWN')
-			   AS finding
-		FROM #deadlock_process AS dp
-		WHERE 1 = 1
-		AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dp.client_app = @AppName OR @AppName IS NULL)
-		AND (dp.host_name = @HostName OR @HostName IS NULL)
-		AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-		GROUP BY DB_NAME(dp.database_id), dp.login_name, dp.client_app, dp.host_name
-		OPTION ( RECOMPILE );
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
+        /*Check 2 is deadlocks with selects*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 2 select deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Check 6 breaks down the types of locks (object, page, key, etc.)*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 6 %s', 0, 1, @d) WITH NOWAIT;
-		WITH lock_types AS (
-				SELECT DB_NAME(dp.database_id) AS database_name,
-					   dow.object_name, 
-					   SUBSTRING(dp.wait_resource, 1, CHARINDEX(':', dp.wait_resource) -1) AS lock,
-					   CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT dp.id)) AS lock_count
-				FROM #deadlock_process AS dp 
-				JOIN #deadlock_owner_waiter AS dow
-				ON dp.id = dow.owner_id
-				AND dp.event_date = dow.event_date
-				WHERE 1 = 1
-				AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-				AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-				AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-				AND (dp.client_app = @AppName OR @AppName IS NULL)
-				AND (dp.host_name = @HostName OR @HostName IS NULL)
-				AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-				AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
-				AND dow.object_name IS NOT NULL
-				GROUP BY DB_NAME(dp.database_id), SUBSTRING(dp.wait_resource, 1, CHARINDEX(':', dp.wait_resource) - 1), dow.object_name
-							)	
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT DISTINCT 6 AS check_id,
-			   lt.database_name,
-			   lt.object_name,
-			   'Types of locks by object' AS finding_group,
-			   'This object has had ' +
-			   STUFF((SELECT DISTINCT N', ' + lt2.lock_count + ' ' + lt2.lock
-									FROM lock_types AS lt2
-									WHERE lt2.database_name = lt.database_name
-									AND lt2.object_name = lt.object_name
-									FOR XML PATH(N''), TYPE).value(N'.[1]', N'NVARCHAR(MAX)'), 1, 1, N'')
-			   + ' locks'
-		FROM lock_types AS lt
-		OPTION ( RECOMPILE );
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 2,
+            dow.database_name,
+            object_name =
+                N'You Might Need RCSI',
+            finding_group = N'Total Deadlocks Involving Selects',
+            finding =
+                N'There have been ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dow.event_date)
+                ) +
+                N' deadlock(s) between read queries and modification queries.'
+        FROM #deadlock_owner_waiter AS dow
+        WHERE 1 = 1
+        AND dow.lock_mode IN
+            (
+                N'S',
+                N'IS'
+            )
+        AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+        AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+        GROUP BY
+            dow.database_name
+        OPTION(RECOMPILE);
 
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Check 7 gives you more info queries for sp_BlitzCache & BlitzQueryStore*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 7 part 1 %s', 0, 1, @d) WITH NOWAIT;
-		WITH deadlock_stack AS (
-			SELECT  DISTINCT
-					ds.id,
-					ds.proc_name,
-					ds.event_date,
-					PARSENAME(ds.proc_name, 3) AS database_name,
-					PARSENAME(ds.proc_name, 2) AS schema_name,
-					PARSENAME(ds.proc_name, 1) AS proc_only_name,
-					'''' + STUFF((SELECT DISTINCT N',' + ds2.sql_handle
-									FROM #deadlock_stack AS ds2
-									WHERE ds2.id = ds.id
-									AND ds2.event_date = ds.event_date
-					FOR XML PATH(N''), TYPE).value(N'.[1]', N'NVARCHAR(MAX)'), 1, 1, N'') + '''' AS sql_handle_csv
-			FROM #deadlock_stack AS ds
-			GROUP BY PARSENAME(ds.proc_name, 3),
-                     PARSENAME(ds.proc_name, 2),
-                     PARSENAME(ds.proc_name, 1),
-                     ds.id,
-                     ds.proc_name,
-                     ds.event_date
-					)
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT DISTINCT 7 AS check_id,
-			   ISNULL(DB_NAME(dow.database_id), 'UNKNOWN') AS database_name,
-			   ds.proc_name AS object_name,
-			   'More Info - Query' AS finding_group,
-			   'EXEC sp_BlitzCache ' +
-					CASE WHEN ds.proc_name = 'adhoc'
-						 THEN ' @OnlySqlHandles = ' + ds.sql_handle_csv
-						 ELSE '@StoredProcName = ' + 
-						       QUOTENAME(ds.proc_only_name, '''')
-					END +
-					';' AS finding
-		FROM deadlock_stack AS ds
-		JOIN #deadlock_owner_waiter AS dow
-		ON dow.owner_id = ds.id
-		AND dow.event_date = ds.event_date
-		WHERE 1 = 1
-		AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dow.object_name = @StoredProcName OR @StoredProcName IS NULL)
-		OPTION ( RECOMPILE );
+        /*Check 3 is deadlocks by object*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 3 object deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		IF @ProductVersionMajor >= 13
-		BEGIN
-		SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 7 part 2 %s', 0, 1, @d) WITH NOWAIT;
-		WITH deadlock_stack AS (
-			SELECT  DISTINCT
-					ds.id,
-					ds.sql_handle,
-					ds.proc_name,
-					ds.event_date,
-					PARSENAME(ds.proc_name, 3) AS database_name,
-					PARSENAME(ds.proc_name, 2) AS schema_name,
-					PARSENAME(ds.proc_name, 1) AS proc_only_name
-			FROM #deadlock_stack AS ds	
-					)
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT DISTINCT 7 AS check_id,
-			   DB_NAME(dow.database_id) AS database_name,
-			   ds.proc_name AS object_name,
-			   'More Info - Query' AS finding_group,
-			   'EXEC sp_BlitzQueryStore ' 
-			   + '@DatabaseName = ' 
-			   + QUOTENAME(ds.database_name, '''')
-			   + ', '
-			   + '@StoredProcName = ' 
-			   + QUOTENAME(ds.proc_only_name, '''')
-			   + ';' AS finding
-		FROM deadlock_stack AS ds
-		JOIN #deadlock_owner_waiter AS dow
-		ON dow.owner_id = ds.id
-		AND dow.event_date = ds.event_date
-		WHERE ds.proc_name <> 'adhoc'
-		AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dow.object_name = @StoredProcName OR @StoredProcName IS NULL)
-		OPTION ( RECOMPILE );
-		END;
-		
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 3,
+            dow.database_name,
+            object_name =
+                ISNULL
+                (
+                    dow.object_name,
+                    N'UNKNOWN'
+                ),
+            finding_group = N'Total Object Deadlocks',
+            finding =
+                N'This object was involved in ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dow.event_date)
+                ) +
+                N' deadlock(s).'
+        FROM #deadlock_owner_waiter AS dow
+        WHERE 1 = 1
+        AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+        AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+        GROUP BY
+            dow.database_name,
+            dow.object_name
+        OPTION(RECOMPILE);
 
-		/*Check 8 gives you stored proc deadlock counts*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 8 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding )
-		SELECT 8 AS check_id,
-			   DB_NAME(dp.database_id) AS database_name,
-			   ds.proc_name, 
-			   'Stored Procedure Deadlocks',
-			   'The stored procedure ' 
-			   + PARSENAME(ds.proc_name, 2)
-			   + '.'
-			   + PARSENAME(ds.proc_name, 1)
-			   + ' has been involved in '
-			   + CONVERT(NVARCHAR(10), COUNT_BIG(DISTINCT ds.id))
-			   + ' deadlocks.'
-		FROM #deadlock_stack AS ds
-		JOIN #deadlock_process AS dp
-		ON dp.id = ds.id
-		AND ds.event_date = dp.event_date
-		WHERE ds.proc_name <> 'adhoc'
-		AND (ds.proc_name = @StoredProcName OR @StoredProcName IS NULL)
-		AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-		AND (dp.client_app = @AppName OR @AppName IS NULL)
-		AND (dp.host_name = @HostName OR @HostName IS NULL)
-		AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-		GROUP BY DB_NAME(dp.database_id), ds.proc_name
-		OPTION(RECOMPILE);
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
+        /*Check 3 continuation, number of deadlocks per index*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 3 (continued) index deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Check 9 gives you more info queries for sp_BlitzIndex */
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 9 %s', 0, 1, @d) WITH NOWAIT;
-		WITH bi AS (
-				SELECT  DISTINCT
-					dow.object_name,
-					DB_NAME(dow.database_id) as database_name,
-					a.schema_name AS schema_name,
-					a.table_name AS table_name
-				FROM #deadlock_owner_waiter AS dow
-				LEFT JOIN @sysAssObjId a ON a.database_id=dow.database_id AND a.partition_id = dow.associatedObjectId
-				WHERE 1 = 1
-				AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-				AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-				AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-				AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
-				AND dow.object_name IS NOT NULL
-		)
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT 9 AS check_id,	
-				bi.database_name,
-				bi.object_name,
-				'More Info - Table' AS finding_group,
-				'EXEC sp_BlitzIndex ' + 
-				'@DatabaseName = ' + QUOTENAME(bi.database_name, '''') + 
-				', @SchemaName = ' + QUOTENAME(bi.schema_name, '''') + 
-				', @TableName = ' + QUOTENAME(bi.table_name, '''') +
-				';'	 AS finding
-		FROM bi
-		OPTION ( RECOMPILE );
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 3,
+            dow.database_name,
+            index_name = dow.index_name,
+            finding_group = N'Total Index Deadlocks',
+            finding =
+                N'This index was involved in ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dow.event_date)
+                ) +
+                N' deadlock(s).'
+        FROM #deadlock_owner_waiter AS dow
+        WHERE 1 = 1
+        AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+        AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+        AND dow.lock_type NOT IN
+            (
+                N'HEAP',
+                N'RID'
+            )
+        AND dow.index_name IS NOT NULL
+        GROUP BY
+            dow.database_name,
+            dow.index_name
+        OPTION(RECOMPILE);
 
-		/*Check 10 gets total deadlock wait time per object*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 10 %s', 0, 1, @d) WITH NOWAIT;
-		WITH chopsuey AS (
-				SELECT DISTINCT
-				PARSENAME(dow.object_name, 3) AS database_name,
-				dow.object_name,
-				CONVERT(VARCHAR(10), (SUM(DISTINCT CONVERT(BIGINT, dp.wait_time)) / 1000) / 86400) AS wait_days,
-				CONVERT(VARCHAR(20), DATEADD(SECOND, (SUM(DISTINCT CONVERT(BIGINT, dp.wait_time)) / 1000), 0), 108) AS wait_time_hms
-				FROM #deadlock_owner_waiter AS dow
-				JOIN #deadlock_process AS dp
-				ON (dp.id = dow.owner_id OR dp.victim_id = dow.waiter_id)
-					AND dp.event_date = dow.event_date
-				WHERE 1 = 1
-				AND (DB_NAME(dow.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-				AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
-				AND (dow.event_date < @EndDate OR @EndDate IS NULL)
-				AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
-				AND (dp.client_app = @AppName OR @AppName IS NULL)
-				AND (dp.host_name = @HostName OR @HostName IS NULL)
-				AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-				GROUP BY PARSENAME(dow.object_name, 3), dow.object_name
-						)
-				INSERT #deadlock_findings WITH (TABLOCKX) 
-                ( check_id, database_name, object_name, finding_group, finding ) 
-				SELECT 10 AS check_id,
-						cs.database_name,
-						cs.object_name,
-						'Total object deadlock wait time' AS finding_group,
-						'This object has had ' 
-						+ CONVERT(VARCHAR(10), cs.wait_days) 
-						+ ':' + CONVERT(VARCHAR(20), cs.wait_time_hms, 108)
-						+ ' [d/h/m/s] of deadlock wait time.' AS finding
-				FROM chopsuey AS cs
-				WHERE cs.object_name IS NOT NULL
-				OPTION ( RECOMPILE );
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Check 11 gets total deadlock wait time per database*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 11 %s', 0, 1, @d) WITH NOWAIT;
-		WITH wait_time AS (
-						SELECT DB_NAME(dp.database_id) AS database_name,
-							   SUM(CONVERT(BIGINT, dp.wait_time)) AS total_wait_time_ms
-						FROM #deadlock_process AS dp
-						WHERE 1 = 1
-						AND (DB_NAME(dp.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-						AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
-						AND (dp.event_date < @EndDate OR @EndDate IS NULL)
-						AND (dp.client_app = @AppName OR @AppName IS NULL)
-						AND (dp.host_name = @HostName OR @HostName IS NULL)
-						AND (dp.login_name = @LoginName OR @LoginName IS NULL)
-						GROUP BY DB_NAME(dp.database_id)
-						  )
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		SELECT 11 AS check_id,
-				wt.database_name,
-				'-' AS object_name,
-				'Total database deadlock wait time' AS finding_group,
-				'This database has had ' 
-				+ CONVERT(VARCHAR(10), (SUM(DISTINCT CONVERT(BIGINT, wt.total_wait_time_ms)) / 1000) / 86400) 
-				+ ':' + CONVERT(VARCHAR(20), DATEADD(SECOND, (SUM(DISTINCT CONVERT(BIGINT, wt.total_wait_time_ms)) / 1000), 0), 108)
-				+ ' [d/h/m/s] of deadlock wait time.'
-		FROM wait_time AS wt
-		GROUP BY wt.database_name
-		OPTION ( RECOMPILE );
+        /*Check 3 continuation, number of deadlocks per heap*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 3 (continued) heap deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Check 12 gets total deadlock wait time for SQL Agent*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 12 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding )         
-        SELECT 12,
-               DB_NAME(aj.database_id),
-               'SQLAgent - Job: ' 
-                + aj.job_name
-                + ' Step: '
-                + aj.step_name,
-               'Agent Job Deadlocks',
-               RTRIM(COUNT(*)) + ' deadlocks from this Agent Job and Step'
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 3,
+            dow.database_name,
+            index_name = dow.index_name,
+            finding_group = N'Total Heap Deadlocks',
+            finding =
+                N'This heap was involved in ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dow.event_date)
+                ) +
+                N' deadlock(s).'
+        FROM #deadlock_owner_waiter AS dow
+        WHERE 1 = 1
+        AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+        AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+        AND dow.lock_type IN
+            (
+                N'HEAP',
+                N'RID'
+            )
+        GROUP BY
+            dow.database_name,
+            dow.index_name
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 4 looks for Serializable deadlocks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 4 serializable deadlocks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 4,
+            database_name =
+                dp.database_name,
+            object_name = N'-',
+            finding_group = N'Serializable Deadlocking',
+            finding =
+                N'This database has had ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dp.event_date)
+                ) +
+                N' instances of Serializable deadlocks.'
+        FROM #deadlock_process AS dp
+        WHERE dp.isolation_level LIKE N'serializable%'
+        AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+        AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dp.client_app = @AppName OR @AppName IS NULL)
+        AND (dp.host_name = @HostName OR @HostName IS NULL)
+        AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        GROUP BY dp.database_name
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 5 looks for Repeatable Read deadlocks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 5 repeatable read deadlocks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 5,
+            dp.database_name,
+            object_name = N'-',
+            finding_group = N'Repeatable Read Deadlocking',
+            finding =
+                N'This database has had ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dp.event_date)
+                ) +
+                N' instances of Repeatable Read deadlocks.'
+        FROM #deadlock_process AS dp
+        WHERE dp.isolation_level LIKE N'repeatable%'
+        AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+        AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dp.client_app = @AppName OR @AppName IS NULL)
+        AND (dp.host_name = @HostName OR @HostName IS NULL)
+        AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        GROUP BY dp.database_name
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 6 breaks down app, host, and login information*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 6 app/host/login deadlocks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 6,
+            database_name =
+                dp.database_name,
+            object_name = N'-',
+            finding_group = N'Login, App, and Host deadlocks',
+            finding =
+                N'This database has had ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dp.event_date)
+                ) +
+                N' instances of deadlocks involving the login ' +
+                ISNULL
+                (
+                    dp.login_name,
+                    N'UNKNOWN'
+                ) +
+                N' from the application ' +
+                ISNULL
+                (
+                    dp.client_app,
+                    N'UNKNOWN'
+                ) +
+                N' on host ' +
+                ISNULL
+                (
+                    dp.host_name,
+                    N'UNKNOWN'
+                ) +
+                N'.'
+        FROM #deadlock_process AS dp
+        WHERE 1 = 1
+        AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+        AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dp.client_app = @AppName OR @AppName IS NULL)
+        AND (dp.host_name = @HostName OR @HostName IS NULL)
+        AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        GROUP BY
+            dp.database_name,
+            dp.login_name,
+            dp.client_app,
+            dp.host_name
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 7 breaks down the types of deadlocks (object, page, key, etc.)*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 7 types of deadlocks %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            lock_types AS
+        (
+            SELECT
+                database_name =
+                    dp.database_name,
+                dow.object_name,
+                lock =
+                    CASE
+                        WHEN CHARINDEX(N':', dp.wait_resource) > 0
+                        THEN SUBSTRING
+                             (
+                                 dp.wait_resource,
+                                 1,
+                                 CHARINDEX(N':', dp.wait_resource) - 1
+                             )
+                        ELSE dp.wait_resource
+                    END,
+                lock_count =
+                    CONVERT
+                    (
+                        nvarchar(20),
+                        COUNT_BIG(DISTINCT dp.event_date)
+                    )
+            FROM #deadlock_process AS dp
+            JOIN #deadlock_owner_waiter AS dow
+              ON (dp.id = dow.owner_id
+                  OR dp.victim_id = dow.waiter_id)
+              AND dp.event_date = dow.event_date
+            WHERE 1 = 1
+            AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+            AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+            AND (dp.client_app = @AppName OR @AppName IS NULL)
+            AND (dp.host_name = @HostName OR @HostName IS NULL)
+            AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+            AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+            AND dow.object_name IS NOT NULL
+            GROUP BY
+                dp.database_name,
+                CASE
+                    WHEN CHARINDEX(N':', dp.wait_resource) > 0
+                    THEN SUBSTRING
+                         (
+                             dp.wait_resource,
+                             1,
+                             CHARINDEX(N':', dp.wait_resource) - 1
+                         )
+                    ELSE dp.wait_resource
+                END,
+                dow.object_name
+        )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 7,
+            lt.database_name,
+            lt.object_name,
+            finding_group = N'Types of locks by object',
+            finding =
+                N'This object has had ' +
+                STUFF
+                (
+                    (
+                        SELECT
+                            N', ' +
+                            lt2.lock_count +
+                            N' ' +
+                            lt2.lock
+                        FROM lock_types AS lt2
+                        WHERE lt2.database_name = lt.database_name
+                        AND   lt2.object_name = lt.object_name
+                        FOR XML
+                            PATH(N''),
+                            TYPE
+                    ).value(N'.[1]', N'nvarchar(MAX)'),
+                    1,
+                    1,
+                    N''
+                ) + N' locks.'
+        FROM lock_types AS lt
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 8 gives you more info queries for sp_BlitzCache & BlitzQueryStore*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 8 more info part 1 BlitzCache %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            deadlock_stack AS
+            (
+                SELECT DISTINCT
+                    ds.id,
+                    ds.proc_name,
+                    ds.event_date,
+                    database_name =
+                        PARSENAME(ds.proc_name, 3),
+                    schema_name =
+                        PARSENAME(ds.proc_name, 2),
+                    proc_only_name =
+                        PARSENAME(ds.proc_name, 1),
+                    sql_handle_csv =
+                        N'''' +
+                        STUFF
+                        (
+                            (
+                                SELECT DISTINCT
+                                    N',' +
+                                    ds2.sql_handle
+                                FROM #deadlock_stack AS ds2
+                                WHERE ds2.id = ds.id
+                                AND   ds2.event_date = ds.event_date
+                                AND   ds2.sql_handle <> 0x
+                                FOR XML
+                                    PATH(N''),
+                                    TYPE
+                            ).value(N'.[1]', N'nvarchar(MAX)'),
+                            1,
+                            1,
+                            N''
+                        ) +
+                        N''''
+                FROM #deadlock_stack AS ds
+                WHERE ds.sql_handle <> 0x
+                GROUP BY
+                    PARSENAME(ds.proc_name, 3),
+                    PARSENAME(ds.proc_name, 2),
+                    PARSENAME(ds.proc_name, 1),
+                    ds.id,
+                    ds.proc_name,
+                    ds.event_date
+            )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT DISTINCT
+            check_id = 8,
+            dow.database_name,
+            object_name = ds.proc_name,
+            finding_group = N'More Info - Query',
+            finding = N'EXEC sp_BlitzCache ' +
+                CASE
+                    WHEN ds.proc_name = N'adhoc'
+                    THEN N'@OnlySqlHandles = ' + ds.sql_handle_csv
+                    ELSE N'@StoredProcName = ' + QUOTENAME(ds.proc_only_name, N'''')
+                END + N';'
+        FROM deadlock_stack AS ds
+        JOIN #deadlock_owner_waiter AS dow
+          ON dow.owner_id = ds.id
+          AND dow.event_date = ds.event_date
+        WHERE 1 = 1
+        AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+        AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dow.object_name = @StoredProcName OR @StoredProcName IS NULL)
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        IF (@ProductVersionMajor >= 13 OR @Azure = 1)
+        BEGIN
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Check 8 more info part 2 BlitzQueryStore %s', 0, 1, @d) WITH NOWAIT;
+
+            WITH
+                deadlock_stack AS
+            (
+                SELECT DISTINCT
+                    ds.id,
+                    ds.sql_handle,
+                    ds.proc_name,
+                    ds.event_date,
+                    database_name =
+                        PARSENAME(ds.proc_name, 3),
+                    schema_name =
+                        PARSENAME(ds.proc_name, 2),
+                    proc_only_name =
+                        PARSENAME(ds.proc_name, 1)
+                FROM #deadlock_stack AS ds
+            )
+            INSERT
+                #deadlock_findings WITH(TABLOCKX)
+            (
+                check_id,
+                database_name,
+                object_name,
+                finding_group,
+                finding
+            )
+            SELECT DISTINCT
+                check_id = 8,
+                dow.database_name,
+                object_name = ds.proc_name,
+                finding_group = N'More Info - Query',
+                finding =
+                    N'EXEC sp_BlitzQueryStore ' +
+                    N'@DatabaseName = ' +
+                    QUOTENAME(ds.database_name, N'''') +
+                    N', ' +
+                    N'@StoredProcName = ' +
+                    QUOTENAME(ds.proc_only_name, N'''') +
+                    N';'
+            FROM deadlock_stack AS ds
+            JOIN #deadlock_owner_waiter AS dow
+              ON dow.owner_id = ds.id
+              AND dow.event_date = ds.event_date
+            WHERE ds.proc_name <> N'adhoc'
+            AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+            AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+            AND (dow.object_name = @StoredProcName OR @StoredProcName IS NULL)
+            OPTION(RECOMPILE);
+
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+        END;
+
+        /*Check 9 gives you stored procedure deadlock counts*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 9 stored procedure deadlocks %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 9,
+            database_name =
+                dp.database_name,
+            object_name = ds.proc_name,
+            finding_group = N'Stored Procedure Deadlocks',
+            finding =
+                N'The stored procedure ' +
+                PARSENAME(ds.proc_name, 2) +
+                N'.' +
+                PARSENAME(ds.proc_name, 1) +
+                N' has been involved in ' +
+                CONVERT
+                (
+                    nvarchar(10),
+                    COUNT_BIG(DISTINCT ds.id)
+                ) +
+                N' deadlocks.'
+        FROM #deadlock_stack AS ds
+        JOIN #deadlock_process AS dp
+          ON dp.id = ds.id
+          AND ds.event_date = dp.event_date
+        WHERE ds.proc_name <> N'adhoc'
+        AND (ds.proc_name = @StoredProcName OR @StoredProcName IS NULL)
+        AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+        AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+        AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+        AND (dp.client_app = @AppName OR @AppName IS NULL)
+        AND (dp.host_name = @HostName OR @HostName IS NULL)
+        AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        GROUP BY
+            dp.database_name,
+            ds.proc_name
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 10 gives you more info queries for sp_BlitzIndex */
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 10 more info, BlitzIndex  %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            bi AS
+            (
+                SELECT DISTINCT
+                    dow.object_name,
+                    dow.database_name,
+                    schema_name = s.schema_name,
+                    table_name = s.table_name
+                FROM #deadlock_owner_waiter AS dow
+                JOIN @sysAssObjId AS s
+                  ON  s.database_id = dow.database_id
+                  AND s.partition_id = dow.associatedObjectId
+                WHERE 1 = 1
+                AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
+                AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
+                AND (dow.event_date < @EndDate OR @EndDate IS NULL)
+                AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+                AND dow.object_name IS NOT NULL
+            )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT DISTINCT
+            check_id = 10,
+            bi.database_name,
+            bi.object_name,
+            finding_group = N'More Info - Table',
+            finding =
+                N'EXEC sp_BlitzIndex ' +
+                N'@DatabaseName = ' +
+                QUOTENAME(bi.database_name, N'''') +
+                N', @SchemaName = ' +
+                QUOTENAME(bi.schema_name, N'''') +
+                N', @TableName = ' +
+                QUOTENAME(bi.table_name, N'''') +
+                N';'
+        FROM bi
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 11 gets total deadlock wait time per object*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 11 deadlock wait time per object %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            chopsuey AS
+        (
+
+         SELECT
+             database_name =
+                 dp.database_name,
+             dow.object_name,
+             wait_days =
+                 CONVERT
+                 (
+                     nvarchar(30),
+                     (
+                         SUM
+                         (
+                             CONVERT
+                             (
+                                 bigint,
+                                 dp.wait_time
+                             )
+                          ) / 1000 / 86400
+                     )
+                 ),
+             wait_time_hms =
+             /*the more wait time you rack up the less accurate this gets, 
+             it's either that or erroring out*/
+            CASE 
+                WHEN 
+                    SUM
+                    (
+                        CONVERT
+                        (
+                            bigint, 
+                            dp.wait_time
+                        )
+                    )/1000 > 2147483647
+                THEN 
+                   CONVERT
+                   (
+                       nvarchar(30),
+                       DATEADD
+                       (
+                            MINUTE,
+                            (
+                                 (
+                                    SUM
+                                    (
+                                       CONVERT
+                                       (
+                                           bigint, 
+                                           dp.wait_time
+                                       )
+                                    )
+                                 )/
+                                 60000
+                            ),
+                            0
+                       ),
+                       14
+                   )
+                WHEN 
+                    SUM
+                    (
+                        CONVERT
+                        (
+                            bigint, 
+                            dp.wait_time
+                        )
+                    ) BETWEEN 2147483648 AND 2147483647000
+                THEN 
+                   CONVERT
+                   (
+                       nvarchar(30),
+                       DATEADD
+                       (
+                            SECOND,
+                            (
+                                 (
+                                    SUM
+                                    (
+                                       CONVERT
+                                       (
+                                           bigint, 
+                                           dp.wait_time
+                                       )
+                                    )
+                                 )/
+                                 1000
+                            ),
+                            0
+                       ),
+                       14
+                   )
+                ELSE
+                 CONVERT
+                 (
+                     nvarchar(30),
+                     DATEADD
+                     (
+                         MILLISECOND,
+                         (
+                             SUM
+                             (
+                                 CONVERT
+                                 (
+                                     bigint,
+                                     dp.wait_time
+                                  )
+                             )
+                         ),
+                         0
+                    ),
+                    14
+                 )
+				 END
+            FROM #deadlock_owner_waiter AS dow
+            JOIN #deadlock_process AS dp
+              ON (dp.id = dow.owner_id
+                  OR dp.victim_id = dow.waiter_id)
+              AND dp.event_date = dow.event_date
+            WHERE 1 = 1
+            AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+            AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+            AND (dow.object_name = @ObjectName OR @ObjectName IS NULL)
+            AND (dp.client_app = @AppName OR @AppName IS NULL)
+            AND (dp.host_name = @HostName OR @HostName IS NULL)
+            AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+            GROUP BY
+                dp.database_name,
+                dow.object_name
+        )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 11,
+            cs.database_name,
+            cs.object_name,
+            finding_group = N'Total object deadlock wait time',
+            finding =
+                N'This object has had ' +
+                CONVERT
+                (
+                    nvarchar(30),
+                    cs.wait_days
+                ) +
+                N' ' +
+                CONVERT
+                (
+                    nvarchar(30),
+                    cs.wait_time_hms,
+                    14
+                ) +
+                N' [dd hh:mm:ss:ms] of deadlock wait time.'
+        FROM chopsuey AS cs
+        WHERE cs.object_name IS NOT NULL
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 12 gets total deadlock wait time per database*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 12 deadlock wait time per database %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            wait_time AS
+        (
+            SELECT
+                database_name =
+                    dp.database_name,
+                total_wait_time_ms =
+                    SUM
+                    (
+                        CONVERT
+                        (
+                            bigint,
+                            dp.wait_time
+                        )
+                    )
+            FROM #deadlock_owner_waiter AS dow
+            JOIN #deadlock_process AS dp
+              ON (dp.id = dow.owner_id
+                  OR dp.victim_id = dow.waiter_id)
+              AND dp.event_date = dow.event_date
+            WHERE 1 = 1
+            AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+            AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+            AND (dp.client_app = @AppName OR @AppName IS NULL)
+            AND (dp.host_name = @HostName OR @HostName IS NULL)
+            AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+            GROUP BY
+                dp.database_name
+        )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 12,
+            wt.database_name,
+            object_name = N'-',
+            finding_group = N'Total database deadlock wait time',
+            N'This database has had ' +
+            CONVERT
+            (
+                nvarchar(30),
+                (
+                    SUM
+                    (
+                        CONVERT
+                        (
+                            bigint,
+                            wt.total_wait_time_ms
+                        )
+                    ) / 1000 / 86400
+                )
+            ) +
+            N' ' +
+        /*the more wait time you rack up the less accurate this gets, 
+        it's either that or erroring out*/
+            CASE 
+                WHEN 
+                    SUM
+                    (
+                        CONVERT
+                        (
+                            bigint, 
+                            wt.total_wait_time_ms
+                        )
+                    )/1000 > 2147483647
+                THEN 
+                   CONVERT
+                   (
+                       nvarchar(30),
+                       DATEADD
+                       (
+                            MINUTE,
+                            (
+                                 (
+                                    SUM
+                                    (
+                                       CONVERT
+                                       (
+                                           bigint, 
+                                           wt.total_wait_time_ms
+                                       )
+                                    )
+                                 )/
+                                 60000
+                            ),
+                            0
+                       ),
+                       14
+                   )
+                WHEN 
+                    SUM
+                    (
+                        CONVERT
+                        (
+                            bigint, 
+                            wt.total_wait_time_ms
+                        )
+                    ) BETWEEN 2147483648 AND 2147483647000
+                THEN 
+                   CONVERT
+                   (
+                       nvarchar(30),
+                       DATEADD
+                       (
+                            SECOND,
+                            (
+                                 (
+                                    SUM
+                                    (
+                                       CONVERT
+                                       (
+                                           bigint, 
+                                           wt.total_wait_time_ms
+                                       )
+                                    )
+                                 )/
+                                 1000
+                            ),
+                            0
+                       ),
+                       14
+                   )
+                ELSE
+            CONVERT
+              (
+                  nvarchar(30),
+                  DATEADD
+                  (
+                      MILLISECOND,
+                      (
+                          SUM
+                          (
+                              CONVERT
+                              (
+                                  bigint,
+                                  wt.total_wait_time_ms
+                              )
+                          )
+                      ),
+                      0
+                  ),
+                  14
+              ) END +
+            N' [dd hh:mm:ss:ms] of deadlock wait time.'
+        FROM wait_time AS wt
+        GROUP BY
+            wt.database_name
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 13 gets total deadlock wait time for SQL Agent*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 13 deadlock count for SQL Agent %s', 0, 1, @d) WITH NOWAIT;
+
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 13,
+            database_name =
+                DB_NAME(aj.database_id),
+            object_name =
+                N'SQLAgent - Job: ' +
+                aj.job_name +
+                N' Step: ' +
+                aj.step_name,
+            finding_group = N'Agent Job Deadlocks',
+            finding =
+                N'There have been ' +
+                RTRIM(COUNT_BIG(DISTINCT aj.event_date)) +
+                N' deadlocks from this Agent Job and Step.'
         FROM #agent_job AS aj
-        GROUP BY DB_NAME(aj.database_id), aj.job_name, aj.step_name
-		OPTION ( RECOMPILE );
+        GROUP BY
+            DB_NAME(aj.database_id),
+            aj.job_name,
+            aj.step_name
+        OPTION(RECOMPILE);
 
-		/*Check 13 is total parallel deadlocks*/
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Check 13 %s', 0, 1, @d) WITH NOWAIT;
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-        ( check_id, database_name, object_name, finding_group, finding ) 	
-		SELECT 13 AS check_id, 
-			   N'-' AS database_name, 
-			   '-' AS object_name,
-			   'Total parallel deadlocks' AS finding_group,
-			   'There have been ' 
-				+ CONVERT(NVARCHAR(20), COUNT_BIG(DISTINCT drp.event_date)) 
-				+ ' parallel deadlocks.'
-        FROM   #deadlock_resource_parallel AS drp
-		WHERE 1 = 1
-		HAVING COUNT_BIG(DISTINCT drp.event_date) > 0
-		OPTION ( RECOMPILE );
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Thank you goodnight*/
-		INSERT #deadlock_findings WITH (TABLOCKX) 
-         ( check_id, database_name, object_name, finding_group, finding ) 
-		VALUES ( -1, 
-				 N'sp_BlitzLock ' + CAST(CONVERT(DATETIME, @VersionDate, 102) AS VARCHAR(100)), 
-				 N'SQL Server First Responder Kit', 
-				 N'http://FirstResponderKit.org/', 
-				 N'To get help or add your own contributions, join us at http://FirstResponderKit.org.');
+        /*Check 14 is total parallel deadlocks*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 14 parallel deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 14,
+            database_name = N'-',
+            object_name = N'-',
+            finding_group = N'Total parallel deadlocks',
+            finding =
+                N'There have been ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT drp.event_date)
+                ) +
+                N' parallel deadlocks.'
+        FROM #deadlock_resource_parallel AS drp
+        HAVING COUNT_BIG(DISTINCT drp.event_date) > 0
+        OPTION(RECOMPILE);
 
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-		/*Results*/
-        /*Break in case of emergency*/
-        --CREATE CLUSTERED INDEX cx_whatever ON #deadlock_process (event_date, id);
-        --CREATE CLUSTERED INDEX cx_whatever ON #deadlock_resource_parallel (event_date, owner_id);
-        --CREATE CLUSTERED INDEX cx_whatever ON #deadlock_owner_waiter (event_date, owner_id, waiter_id);
-	IF(@OutputDatabaseCheck = 0)
-	BEGIN
-		
-        SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Results 1 %s', 0, 1, @d) WITH NOWAIT;
-		WITH deadlocks
-		AS ( SELECT N'Regular Deadlock' AS deadlock_type,
-					dp.event_date,
-		            dp.id,
-					dp.victim_id,
-					dp.spid,
-		            dp.database_id,
-		            dp.priority,
-		            dp.log_used,
-		            dp.wait_resource COLLATE DATABASE_DEFAULT AS wait_resource,
-				    CONVERT(
-						XML,
-						STUFF(( SELECT DISTINCT NCHAR(10) 
-										+ N' <object>' 
-										+ ISNULL(c.object_name, N'') 
-										+ N'</object> ' COLLATE DATABASE_DEFAULT AS object_name
-								FROM   #deadlock_owner_waiter AS c
-								WHERE  ( dp.id = c.owner_id
-										OR dp.victim_id = c.waiter_id )
-								AND dp.event_date = c.event_date
-								FOR XML PATH(N''), TYPE ).value(N'.[1]', N'NVARCHAR(4000)'),
-					1, 1, N'')) AS object_names,
-		            dp.wait_time,
-		            dp.transaction_name,
-		            dp.last_tran_started,
-		            dp.last_batch_started,
-		            dp.last_batch_completed,
-		            dp.lock_mode,
-		            dp.transaction_count,
-		            dp.client_app,
-		            dp.host_name,
-		            dp.login_name,
-		            dp.isolation_level,
-		            dp.process_xml.value('(//process/inputbuf/text())[1]', 'NVARCHAR(MAX)') AS inputbuf,
-					DENSE_RANK() OVER ( ORDER BY dp.event_date ) AS en,
-					ROW_NUMBER() OVER ( PARTITION BY dp.event_date ORDER BY dp.event_date ) -1 AS qn,
-					ROW_NUMBER() OVER ( PARTITION BY dp.event_date, dp.id ORDER BY dp.event_date ) AS dn,
-					dp.is_victim,
-					ISNULL(dp.owner_mode, '-') AS owner_mode,
-					NULL AS owner_waiter_type,
-					NULL AS owner_activity,
-					NULL AS owner_waiter_activity,
-					NULL AS owner_merging,
-					NULL AS owner_spilling,
-					NULL AS owner_waiting_to_close,
-					ISNULL(dp.waiter_mode, '-') AS waiter_mode,
-					NULL AS waiter_waiter_type,
-					NULL AS waiter_owner_activity,
-					NULL AS waiter_waiter_activity,
-					NULL AS waiter_merging,
-					NULL AS waiter_spilling,
-					NULL AS waiter_waiting_to_close,
-					dp.deadlock_graph
-		     FROM   #deadlock_process AS dp 
-			 WHERE dp.victim_id IS NOT NULL
-			 AND   dp.is_parallel = 0
-			 
-			 UNION ALL
-			 
-			 SELECT N'Parallel Deadlock' AS deadlock_type,
-					dp.event_date,
-		            dp.id,
-					dp.victim_id,
-					dp.spid,
-		            dp.database_id,
-		            dp.priority,
-		            dp.log_used,
-		            dp.wait_resource COLLATE DATABASE_DEFAULT,
-				    CONVERT(
-						XML,
-						STUFF(( SELECT DISTINCT NCHAR(10) 
-										+ N' <object>' 
-										+ ISNULL(c.object_name, N'') 
-										+ N'</object> ' COLLATE DATABASE_DEFAULT AS object_name
-								FROM   #deadlock_owner_waiter AS c
-								WHERE  ( dp.id = c.owner_id
-										OR dp.victim_id = c.waiter_id )
-								AND dp.event_date = c.event_date
-								FOR XML PATH(N''), TYPE ).value(N'.[1]', N'NVARCHAR(4000)'),
-					1, 1, N'')) AS object_names,
-		            dp.wait_time,
-		            dp.transaction_name,
-		            dp.last_tran_started,
-		            dp.last_batch_started,
-		            dp.last_batch_completed,
-		            dp.lock_mode,
-		            dp.transaction_count,
-		            dp.client_app,
-		            dp.host_name,
-		            dp.login_name,
-		            dp.isolation_level,
-		            dp.process_xml.value('(//process/inputbuf/text())[1]', 'NVARCHAR(MAX)') AS inputbuf,
-					DENSE_RANK() OVER ( ORDER BY dp.event_date ) AS en,
-					ROW_NUMBER() OVER ( PARTITION BY dp.event_date ORDER BY dp.event_date ) -1 AS qn,
-					ROW_NUMBER() OVER ( PARTITION BY dp.event_date, dp.id ORDER BY dp.event_date ) AS dn,
-					1 AS is_victim,
-					cao.wait_type COLLATE DATABASE_DEFAULT AS owner_mode,
-					cao.waiter_type AS owner_waiter_type,
-					cao.owner_activity AS owner_activity,
-					cao.waiter_activity	AS owner_waiter_activity,
-					cao.merging	AS owner_merging,
-					cao.spilling AS owner_spilling,
-					cao.waiting_to_close AS owner_waiting_to_close,
-					caw.wait_type COLLATE DATABASE_DEFAULT AS waiter_mode,
-					caw.waiter_type AS waiter_waiter_type,
-					caw.owner_activity AS waiter_owner_activity,
-					caw.waiter_activity	AS waiter_waiter_activity,
-					caw.merging	AS waiter_merging,
-					caw.spilling AS waiter_spilling,
-					caw.waiting_to_close AS waiter_waiting_to_close,
-					dp.deadlock_graph
-		     FROM   #deadlock_process AS dp 
-			 CROSS APPLY (SELECT TOP 1 * FROM  #deadlock_resource_parallel AS drp WHERE drp.owner_id = dp.id AND drp.wait_type = 'e_waitPipeNewRow' ORDER BY drp.event_date) AS cao
-			 CROSS APPLY (SELECT TOP 1 * FROM  #deadlock_resource_parallel AS drp WHERE drp.owner_id = dp.id AND drp.wait_type = 'e_waitPipeGetRow' ORDER BY drp.event_date) AS caw
-			 WHERE dp.is_parallel = 1 )
-		insert into DeadLockTbl (
-			ServerName,
-			deadlock_type,
-			event_date,
-			database_name,
-			spid,
-			deadlock_group,
-			query,
-			object_names,
-			isolation_level,
-			owner_mode,
-			waiter_mode,
-			transaction_count,
-			login_name,
-			host_name,
-			client_app,
-			wait_time,
-			wait_resource,
-			priority,
-			log_used,
-			last_tran_started,
-			last_batch_started,
-			last_batch_completed,
-			transaction_name,
-			owner_waiter_type,
-			owner_activity,
-			owner_waiter_activity,
-			owner_merging,
-			owner_spilling,
-			owner_waiting_to_close,
-			waiter_waiter_type,
-			waiter_owner_activity,
-			waiter_waiter_activity,
-			waiter_merging,
-			waiter_spilling,
-			waiter_waiting_to_close,
-			deadlock_graph
-			)
-		SELECT @ServerName,
-			   d.deadlock_type,
-			   d.event_date,
-			   DB_NAME(d.database_id) AS database_name,
-			   d.spid,
-		       'Deadlock #' 
-			   + CONVERT(NVARCHAR(10), d.en)
-			   + ', Query #' 
-			   + CASE WHEN d.qn = 0 THEN N'1' ELSE CONVERT(NVARCHAR(10), d.qn) END 
-			   + CASE WHEN d.is_victim = 1 THEN ' - VICTIM' ELSE '' END
-			   AS deadlock_group, 
-		       CONVERT(XML, N'<inputbuf><![CDATA[' + d.inputbuf + N']]></inputbuf>') AS query,
-		       d.object_names,
-		       d.isolation_level,
-			   d.owner_mode,
-			   d.waiter_mode,
-		       d.transaction_count,
-		       d.login_name,
-		       d.host_name,
-		       d.client_app,
-		       d.wait_time,
-		       d.wait_resource,
-		       d.priority,
-			   d.log_used,
-		       d.last_tran_started,
-		       d.last_batch_started,
-		       d.last_batch_completed,
-		       d.transaction_name,
-			   /*These columns will be NULL for regular (non-parallel) deadlocks*/
-			   d.owner_waiter_type,
-			   d.owner_activity,
-			   d.owner_waiter_activity,
-			   d.owner_merging,
-			   d.owner_spilling,
-			   d.owner_waiting_to_close,
-			   d.waiter_waiter_type,
-			   d.waiter_owner_activity,
-			   d.waiter_waiter_activity,
-			   d.waiter_merging,
-			   d.waiter_spilling,
-			   d.waiter_waiting_to_close,
-			   d.deadlock_graph
-		FROM   deadlocks AS d
-		WHERE  d.dn = 1
-		AND (is_victim = @VictimsOnly OR @VictimsOnly = 0)
-		AND d.qn < CASE WHEN d.deadlock_type = N'Parallel Deadlock' THEN 2 ELSE 2147483647 END  
-		AND (DB_NAME(d.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-		AND (d.event_date >= @StartDate OR @StartDate IS NULL)
-		AND (d.event_date < @EndDate OR @EndDate IS NULL)
-		AND (CONVERT(NVARCHAR(MAX), d.object_names) LIKE '%' + @ObjectName + '%' OR @ObjectName IS NULL)
-		AND (d.client_app = @AppName OR @AppName IS NULL)
-		AND (d.host_name = @HostName OR @HostName IS NULL)
-		AND (d.login_name = @LoginName OR @LoginName IS NULL)
-		ORDER BY d.event_date, is_victim DESC
-		OPTION ( RECOMPILE );
-		
-		drop SYNONYM DeadLockTbl; --done insert into blitzlock table going to insert into findings table first create synonym.
+        /*Check 15 is total deadlocks involving sleeping sessions*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 15 sleeping deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		--	RAISERROR('att deadlock findings', 0, 1) WITH NOWAIT;
-	
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 15,
+            database_name = N'-',
+            object_name = N'-',
+            finding_group = N'Total deadlocks involving sleeping sessions',
+            finding =
+                N'There have been ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dp.event_date)
+                ) +
+                N' sleepy deadlocks.'
+        FROM #deadlock_process AS dp
+        WHERE dp.status = N'sleeping'
+        HAVING COUNT_BIG(DISTINCT dp.event_date) > 0
+        OPTION(RECOMPILE);
 
-		SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-        RAISERROR('Findings %s', 0, 1, @d) WITH NOWAIT;
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-		Insert into DeadlockFindings (ServerName,check_id,database_name,object_name,finding_group,finding)
-		SELECT @ServerName,df.check_id, df.database_name, df.object_name, df.finding_group, df.finding
-		FROM #deadlock_findings AS df
-		ORDER BY df.check_id
-		OPTION ( RECOMPILE );
+        /*Check 16 is total deadlocks involving implicit transactions*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 16 implicit transaction deadlocks %s', 0, 1, @d) WITH NOWAIT;
 
-		drop SYNONYM DeadlockFindings; --done with inserting.
-END
-ELSE  --Output to database is not set output to client app
-	BEGIN
-			SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-			RAISERROR('Results 1 %s', 0, 1, @d) WITH NOWAIT;
-			WITH deadlocks
-			AS ( SELECT N'Regular Deadlock' AS deadlock_type,
-						dp.event_date,
-						dp.id,
-						dp.victim_id,
-						dp.spid,
-						dp.database_id,
-						dp.priority,
-						dp.log_used,
-						dp.wait_resource COLLATE DATABASE_DEFAULT AS wait_resource,
-					    CONVERT(
-						XML,
-						STUFF(( SELECT DISTINCT NCHAR(10) 
-										+ N' <object>' 
-										+ ISNULL(c.object_name, N'') 
-										+ N'</object> ' COLLATE DATABASE_DEFAULT AS object_name
-								FROM   #deadlock_owner_waiter AS c
-								WHERE  ( dp.id = c.owner_id
-										OR dp.victim_id = c.waiter_id )
-								AND dp.event_date = c.event_date
-								FOR XML PATH(N''), TYPE ).value(N'.[1]', N'NVARCHAR(4000)'),
-					    1, 1, N'')) AS object_names,
-						dp.wait_time,
-						dp.transaction_name,
-						dp.last_tran_started,
-						dp.last_batch_started,
-						dp.last_batch_completed,
-						dp.lock_mode,
-						dp.transaction_count,
-						dp.client_app,
-						dp.host_name,
-						dp.login_name,
-						dp.isolation_level,
-						dp.process_xml.value('(//process/inputbuf/text())[1]', 'NVARCHAR(MAX)') AS inputbuf,
-						DENSE_RANK() OVER ( ORDER BY dp.event_date ) AS en,
-						ROW_NUMBER() OVER ( PARTITION BY dp.event_date ORDER BY dp.event_date ) -1 AS qn,
-						ROW_NUMBER() OVER ( PARTITION BY dp.event_date, dp.id ORDER BY dp.event_date ) AS dn,
-						dp.is_victim,
-						ISNULL(dp.owner_mode, '-') AS owner_mode,
-						NULL AS owner_waiter_type,
-						NULL AS owner_activity,
-						NULL AS owner_waiter_activity,
-						NULL AS owner_merging,
-						NULL AS owner_spilling,
-						NULL AS owner_waiting_to_close,
-						ISNULL(dp.waiter_mode, '-') AS waiter_mode,
-						NULL AS waiter_waiter_type,
-						NULL AS waiter_owner_activity,
-						NULL AS waiter_waiter_activity,
-						NULL AS waiter_merging,
-						NULL AS waiter_spilling,
-						NULL AS waiter_waiting_to_close,
-						dp.deadlock_graph
-				FROM   #deadlock_process AS dp 
-				WHERE dp.victim_id IS NOT NULL
-				AND   dp.is_parallel = 0			
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        SELECT
+            check_id = 14,
+            database_name = N'-',
+            object_name = N'-',
+            finding_group = N'Total implicit transaction deadlocks',
+            finding =
+                N'There have been ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dp.event_date)
+                ) +
+                N' implicit transaction deadlocks.'
+        FROM #deadlock_process AS dp
+        WHERE dp.transaction_name = N'implicit_transaction'
+        HAVING COUNT_BIG(DISTINCT dp.event_date) > 0
+        OPTION(RECOMPILE);
 
-				UNION ALL
-				
-				SELECT N'Parallel Deadlock' AS deadlock_type,
-						dp.event_date,
-						dp.id,
-						dp.victim_id,
-						dp.spid,
-						dp.database_id,
-						dp.priority,
-						dp.log_used,
-						dp.wait_resource COLLATE DATABASE_DEFAULT,
-					    CONVERT(
-						XML,
-						STUFF(( SELECT DISTINCT NCHAR(10) 
-										+ N' <object>' 
-										+ ISNULL(c.object_name, N'') 
-										+ N'</object> ' COLLATE DATABASE_DEFAULT AS object_name
-								FROM   #deadlock_owner_waiter AS c
-								WHERE  ( dp.id = c.owner_id
-										OR dp.victim_id = c.waiter_id )
-								AND dp.event_date = c.event_date
-								FOR XML PATH(N''), TYPE ).value(N'.[1]', N'NVARCHAR(4000)'),
-					    1, 1, N'')) AS object_names,
-						dp.wait_time,
-						dp.transaction_name,
-						dp.last_tran_started,
-						dp.last_batch_started,
-						dp.last_batch_completed,
-						dp.lock_mode,
-						dp.transaction_count,
-						dp.client_app,
-						dp.host_name,
-						dp.login_name,
-						dp.isolation_level,
-						dp.process_xml.value('(//process/inputbuf/text())[1]', 'NVARCHAR(MAX)') AS inputbuf,
-						DENSE_RANK() OVER ( ORDER BY dp.event_date ) AS en,
-						ROW_NUMBER() OVER ( PARTITION BY dp.event_date ORDER BY dp.event_date ) -1 AS qn,
-						ROW_NUMBER() OVER ( PARTITION BY dp.event_date, dp.id ORDER BY dp.event_date ) AS dn,
-						1 AS is_victim,
-						cao.wait_type COLLATE DATABASE_DEFAULT AS owner_mode,
-						cao.waiter_type AS owner_waiter_type,
-						cao.owner_activity AS owner_activity,
-						cao.waiter_activity	AS owner_waiter_activity,
-						cao.merging	AS owner_merging,
-						cao.spilling AS owner_spilling,
-						cao.waiting_to_close AS owner_waiting_to_close,
-						caw.wait_type COLLATE DATABASE_DEFAULT AS waiter_mode,
-						caw.waiter_type AS waiter_waiter_type,
-						caw.owner_activity AS waiter_owner_activity,
-						caw.waiter_activity	AS waiter_waiter_activity,
-						caw.merging	AS waiter_merging,
-						caw.spilling AS waiter_spilling,
-						caw.waiting_to_close AS waiter_waiting_to_close,
-						dp.deadlock_graph
-				FROM   #deadlock_process AS dp 
-				OUTER APPLY (SELECT TOP 1 * FROM  #deadlock_resource_parallel AS drp WHERE drp.owner_id = dp.id AND drp.wait_type IN ('e_waitPortOpen', 'e_waitPipeNewRow') ORDER BY drp.event_date) AS cao
-				OUTER APPLY (SELECT TOP 1 * FROM  #deadlock_resource_parallel AS drp WHERE drp.owner_id = dp.id AND drp.wait_type IN ('e_waitPortOpen', 'e_waitPipeGetRow') ORDER BY drp.event_date) AS caw
-				WHERE dp.is_parallel = 1
-				)
-				SELECT d.deadlock_type,
-				d.event_date,
-				DB_NAME(d.database_id) AS database_name,
-				d.spid,
-				'Deadlock #' 
-				+ CONVERT(NVARCHAR(10), d.en)
-				+ ', Query #' 
-				+ CASE WHEN d.qn = 0 THEN N'1' ELSE CONVERT(NVARCHAR(10), d.qn) END 
-				+ CASE WHEN d.is_victim = 1 THEN ' - VICTIM' ELSE '' END
-				AS deadlock_group, 
-				CONVERT(XML, N'<inputbuf><![CDATA[' + d.inputbuf + N']]></inputbuf>') AS query_xml,
-				d.inputbuf AS query_string,
-				d.object_names,
-				d.isolation_level,
-				d.owner_mode,
-				d.waiter_mode,
-				d.transaction_count,
-				d.login_name,
-				d.host_name,
-				d.client_app,
-				d.wait_time,
-				d.wait_resource,
-				d.priority,
-				d.log_used,
-				d.last_tran_started,
-				d.last_batch_started,
-				d.last_batch_completed,
-				d.transaction_name,
-				/*These columns will be NULL for regular (non-parallel) deadlocks*/
-				d.owner_waiter_type,
-				d.owner_activity,
-				d.owner_waiter_activity,
-				d.owner_merging,
-				d.owner_spilling,
-				d.owner_waiting_to_close,
-				d.waiter_waiter_type,
-				d.waiter_owner_activity,
-				d.waiter_waiter_activity,
-				d.waiter_merging,
-				d.waiter_spilling,
-				d.waiter_waiting_to_close,
-				d.deadlock_graph,
-				d.is_victim
-			INTO #deadlock_results
-			FROM deadlocks AS d
-			WHERE  d.dn = 1
-			AND (d.is_victim = @VictimsOnly OR @VictimsOnly = 0)
-			AND d.qn < CASE WHEN d.deadlock_type = N'Parallel Deadlock' THEN 2 ELSE 2147483647 END 
-			AND (DB_NAME(d.database_id) = @DatabaseName OR @DatabaseName IS NULL)
-			AND (d.event_date >= @StartDate OR @StartDate IS NULL)
-			AND (d.event_date < @EndDate OR @EndDate IS NULL)
-			AND (CONVERT(NVARCHAR(MAX), d.object_names) LIKE '%' + @ObjectName + '%' OR @ObjectName IS NULL)
-			AND (d.client_app = @AppName OR @AppName IS NULL)
-			AND (d.host_name = @HostName OR @HostName IS NULL)
-			AND (d.login_name = @LoginName OR @LoginName IS NULL)
-			OPTION ( RECOMPILE );
-			
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-			DECLARE @deadlock_result NVARCHAR(MAX) = N''
+        /*Thank you goodnight*/
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding
+        )
+        VALUES
+        (
+            -1,
+            N'sp_BlitzLock version ' + CONVERT(nvarchar(10), @Version),
+            N'Results for ' + CONVERT(nvarchar(10), @StartDate, 23) + N' through ' + CONVERT(nvarchar(10), @EndDate, 23),
+            N'http://FirstResponderKit.org/',
+            N'To get help or add your own contributions to the SQL Server First Responder Kit, join us at http://FirstResponderKit.org.'
+        );
 
-			SET @deadlock_result += N'
-			SELECT
-			   dr.deadlock_type,
-               dr.event_date,
-               dr.database_name,
-               dr.spid,
-               dr.deadlock_group,
-			   '
-			   + CASE @ExportToExcel
-			     WHEN 1
-				 THEN N'dr.query_string AS query,
-				        REPLACE(REPLACE(CONVERT(NVARCHAR(MAX), dr.object_names), ''<object>'', ''''), ''</object>'', '''') AS object_names,'
-				 ELSE N'dr.query_xml AS query,
-				        dr.object_names,'
-				 END +
-			   N'
-               dr.isolation_level,
-               dr.owner_mode,
-               dr.waiter_mode,
-               dr.transaction_count,
-               dr.login_name,
-               dr.host_name,
-               dr.client_app,
-               dr.wait_time,
-               dr.wait_resource,
-               dr.priority,
-               dr.log_used,
-               dr.last_tran_started,
-               dr.last_batch_started,
-               dr.last_batch_completed,
-               dr.transaction_name,
-               dr.owner_waiter_type,
-               dr.owner_activity,
-               dr.owner_waiter_activity,
-               dr.owner_merging,
-               dr.owner_spilling,
-               dr.owner_waiting_to_close,
-               dr.waiter_waiter_type,
-               dr.waiter_owner_activity,
-               dr.waiter_waiter_activity,
-               dr.waiter_merging,
-               dr.waiter_spilling,
-               dr.waiter_waiting_to_close'
-			   + CASE @ExportToExcel
-			     WHEN 1
-				 THEN N''
-				 ELSE N',
-				 dr.deadlock_graph'
-				 END +
-			   '
-			FROM #deadlock_results AS dr
-			ORDER BY dr.event_date, dr.is_victim DESC
-			OPTION(RECOMPILE);
-			'
+        RAISERROR('Finished rollup at %s', 0, 1, @d) WITH NOWAIT;
 
-			EXEC sys.sp_executesql
-			    @deadlock_result;
+        /*Results*/
+        BEGIN
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Results 1 %s', 0, 1, @d) WITH NOWAIT;
 
-			SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-			RAISERROR('Findings %s', 0, 1, @d) WITH NOWAIT;
-			SELECT df.check_id, df.database_name, df.object_name, df.finding_group, df.finding
-			FROM #deadlock_findings AS df
-			ORDER BY df.check_id
-			OPTION ( RECOMPILE );
+            CREATE CLUSTERED INDEX cx_whatever_dp  ON #deadlock_process (event_date, id);
+            CREATE CLUSTERED INDEX cx_whatever_drp ON #deadlock_resource_parallel (event_date, owner_id);
+            CREATE CLUSTERED INDEX cx_whatever_dow ON #deadlock_owner_waiter (event_date, owner_id, waiter_id);
 
-			SET @d = CONVERT(VARCHAR(40), GETDATE(), 109);
-			RAISERROR('Done %s', 0, 1, @d) WITH NOWAIT;
-		END --done with output to client app.
+            IF @Debug = 1 BEGIN SET STATISTICS XML ON; END;
 
+            WITH
+                deadlocks AS
+            (
+                SELECT
+                    deadlock_type =
+                        N'Regular Deadlock',
+                    dp.event_date,
+                    dp.id,
+                    dp.victim_id,
+                    dp.spid,
+                    dp.database_id,
+                    dp.database_name,
+                    dp.current_database_name,
+                    dp.priority,
+                    dp.log_used,
+                    wait_resource =
+                        dp.wait_resource COLLATE DATABASE_DEFAULT,
+                    object_names =
+                        CONVERT
+                        (
+                            xml,
+                            STUFF
+                            (
+                                (
+                                    SELECT DISTINCT
+                                        object_name =
+                                            NCHAR(10) +
+                                            N' <object>' +
+                                            ISNULL(c.object_name, N'') +
+                                            N'</object> ' COLLATE DATABASE_DEFAULT
+                                    FROM #deadlock_owner_waiter AS c
+                                    WHERE (dp.id = c.owner_id
+                                           OR dp.victim_id = c.waiter_id)
+                                    AND dp.event_date = c.event_date
+                                    FOR XML
+                                        PATH(N''),
+                                        TYPE
+                                ).value(N'.[1]', N'nvarchar(4000)'),
+                                1,
+                                1,
+                                N''
+                            )
+                        ),
+                    dp.wait_time,
+                    dp.transaction_name,
+                    dp.status,
+                    dp.last_tran_started,
+                    dp.last_batch_started,
+                    dp.last_batch_completed,
+                    dp.lock_mode,
+                    dp.transaction_count,
+                    dp.client_app,
+                    dp.host_name,
+                    dp.login_name,
+                    dp.isolation_level,
+                    dp.client_option_1,
+                    dp.client_option_2,
+                    inputbuf =
+                        dp.process_xml.value('(//process/inputbuf/text())[1]', 'nvarchar(MAX)'),
+                    en =
+                        DENSE_RANK() OVER (ORDER BY dp.event_date),
+                    qn =
+                        ROW_NUMBER() OVER (PARTITION BY dp.event_date ORDER BY dp.event_date) - 1,
+                    dn =
+                        ROW_NUMBER() OVER (PARTITION BY dp.event_date, dp.id ORDER BY dp.event_date),
+                    dp.is_victim,
+                    owner_mode =
+                        ISNULL(dp.owner_mode, N'-'),
+                    owner_waiter_type = NULL,
+                    owner_activity = NULL,
+                    owner_waiter_activity = NULL,
+                    owner_merging = NULL,
+                    owner_spilling = NULL,
+                    owner_waiting_to_close = NULL,
+                    waiter_mode =
+                        ISNULL(dp.waiter_mode, N'-'),
+                    waiter_waiter_type = NULL,
+                    waiter_owner_activity = NULL,
+                    waiter_waiter_activity = NULL,
+                    waiter_merging = NULL,
+                    waiter_spilling = NULL,
+                    waiter_waiting_to_close = NULL,
+                    dp.deadlock_graph
+                FROM #deadlock_process AS dp
+                WHERE dp.victim_id IS NOT NULL
+                AND   dp.is_parallel = 0
 
+                UNION ALL
+
+                SELECT
+                    deadlock_type =
+                        N'Parallel Deadlock',
+                    dp.event_date,
+                    dp.id,
+                    dp.victim_id,
+                    dp.spid,
+                    dp.database_id,
+                    dp.database_name,
+                    dp.current_database_name,
+                    dp.priority,
+                    dp.log_used,
+                    dp.wait_resource COLLATE DATABASE_DEFAULT,
+                    object_names =
+                        CONVERT
+                        (
+                            xml,
+                            STUFF
+                            (
+                                (
+                                    SELECT DISTINCT
+                                        object_name =
+                                            NCHAR(10) +
+                                            N' <object>' +
+                                            ISNULL(c.object_name, N'') +
+                                            N'</object> ' COLLATE DATABASE_DEFAULT
+                                    FROM #deadlock_owner_waiter AS c
+                                    WHERE (dp.id = c.owner_id
+                                           OR dp.victim_id = c.waiter_id)
+                                    AND dp.event_date = c.event_date
+                                    FOR XML
+                                        PATH(N''),
+                                        TYPE
+                                ).value(N'.[1]', N'nvarchar(4000)'),
+                                1,
+                                1,
+                                N''
+                            )
+                        ),
+                    dp.wait_time,
+                    dp.transaction_name,
+                    dp.status,
+                    dp.last_tran_started,
+                    dp.last_batch_started,
+                    dp.last_batch_completed,
+                    dp.lock_mode,
+                    dp.transaction_count,
+                    dp.client_app,
+                    dp.host_name,
+                    dp.login_name,
+                    dp.isolation_level,
+                    dp.client_option_1,
+                    dp.client_option_2,
+                    inputbuf =
+                        dp.process_xml.value('(//process/inputbuf/text())[1]', 'nvarchar(MAX)'),
+                    en =
+                        DENSE_RANK() OVER (ORDER BY dp.event_date),
+                    qn =
+                        ROW_NUMBER() OVER (PARTITION BY dp.event_date ORDER BY dp.event_date) - 1,
+                    dn =
+                        ROW_NUMBER() OVER (PARTITION BY dp.event_date, dp.id ORDER BY dp.event_date),
+                    is_victim = 1,
+                    owner_mode = cao.wait_type COLLATE DATABASE_DEFAULT,
+                    owner_waiter_type = cao.waiter_type,
+                    owner_activity = cao.owner_activity,
+                    owner_waiter_activity = cao.waiter_activity,
+                    owner_merging = cao.merging,
+                    owner_spilling = cao.spilling,
+                    owner_waiting_to_close = cao.waiting_to_close,
+                    waiter_mode = caw.wait_type COLLATE DATABASE_DEFAULT,
+                    waiter_waiter_type = caw.waiter_type,
+                    waiter_owner_activity = caw.owner_activity,
+                    waiter_waiter_activity = caw.waiter_activity,
+                    waiter_merging = caw.merging,
+                    waiter_spilling = caw.spilling,
+                    waiter_waiting_to_close = caw.waiting_to_close,
+                    dp.deadlock_graph
+                FROM #deadlock_process AS dp
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        drp.*
+                    FROM #deadlock_resource_parallel AS drp
+                    WHERE drp.owner_id = dp.id
+                    AND drp.wait_type IN
+                        (
+                            N'e_waitPortOpen',
+                            N'e_waitPipeNewRow'
+                        )
+                    ORDER BY drp.event_date
+                ) AS cao
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        drp.*
+                    FROM #deadlock_resource_parallel AS drp
+                    WHERE drp.owner_id = dp.id
+                    AND drp.wait_type IN
+                        (
+                            N'e_waitPortOpen',
+                            N'e_waitPipeGetRow'
+                        )
+                    ORDER BY drp.event_date
+                ) AS caw
+                WHERE dp.is_parallel = 1
+            )
+            SELECT
+                d.deadlock_type,
+                d.event_date,
+                d.id,
+                d.victim_id,
+                d.spid,
+                deadlock_group =
+                    N'Deadlock #' +
+                    CONVERT
+                    (
+                        nvarchar(10),
+                        d.en
+                    ) +
+                    N', Query #'
+                    + CASE
+                          WHEN d.qn = 0
+                          THEN N'1'
+                          ELSE CONVERT(nvarchar(10), d.qn)
+                      END + CASE
+                                WHEN d.is_victim = 1
+                                THEN N' - VICTIM'
+                                ELSE N''
+                            END,
+                d.database_id,
+                d.database_name,
+                d.current_database_name,
+                d.priority,
+                d.log_used,
+                d.wait_resource,
+                d.object_names,
+                d.wait_time,
+                d.transaction_name,
+                d.status,
+                d.last_tran_started,
+                d.last_batch_started,
+                d.last_batch_completed,
+                d.lock_mode,
+                d.transaction_count,
+                d.client_app,
+                d.host_name,
+                d.login_name,
+                d.isolation_level,
+                d.client_option_1,
+                d.client_option_2,
+                inputbuf =
+                    CASE
+                        WHEN d.inputbuf
+                             LIKE @inputbuf_bom + N'Proc |[Database Id = %' ESCAPE N'|'
+                        THEN
+                        OBJECT_SCHEMA_NAME
+                        (
+                                SUBSTRING
+                                (
+                                    d.inputbuf,
+                                    CHARINDEX(N'Object Id = ', d.inputbuf) + 12,
+                                    LEN(d.inputbuf) - (CHARINDEX(N'Object Id = ', d.inputbuf) + 12)
+                                )
+                                ,
+                                SUBSTRING
+                                (
+                                    d.inputbuf,
+                                    CHARINDEX(N'Database Id = ', d.inputbuf) + 14,
+                                    CHARINDEX(N'Object Id', d.inputbuf) - (CHARINDEX(N'Database Id = ', d.inputbuf) + 14)
+                                )
+                        ) +
+                        N'.' +
+                        OBJECT_NAME
+                        (
+                             SUBSTRING
+                             (
+                                 d.inputbuf,
+                                 CHARINDEX(N'Object Id = ', d.inputbuf) + 12,
+                                 LEN(d.inputbuf) - (CHARINDEX(N'Object Id = ', d.inputbuf) + 12)
+                             )
+                             ,
+                             SUBSTRING
+                             (
+                                 d.inputbuf,
+                                 CHARINDEX(N'Database Id = ', d.inputbuf) + 14,
+                                 CHARINDEX(N'Object Id', d.inputbuf) - (CHARINDEX(N'Database Id = ', d.inputbuf) + 14)
+                             )
+                        )
+                        ELSE d.inputbuf
+                    END COLLATE Latin1_General_BIN2,
+                d.owner_mode,
+                d.owner_waiter_type,
+                d.owner_activity,
+                d.owner_waiter_activity,
+                d.owner_merging,
+                d.owner_spilling,
+                d.owner_waiting_to_close,
+                d.waiter_mode,
+                d.waiter_waiter_type,
+                d.waiter_owner_activity,
+                d.waiter_waiter_activity,
+                d.waiter_merging,
+                d.waiter_spilling,
+                d.waiter_waiting_to_close,
+                d.deadlock_graph,
+                d.is_victim
+            INTO #deadlocks
+            FROM deadlocks AS d
+            WHERE d.dn = 1
+            AND  (d.is_victim = @VictimsOnly
+            OR    @VictimsOnly = 0)
+            AND d.qn < CASE
+                           WHEN d.deadlock_type = N'Parallel Deadlock'
+                           THEN 2
+                           ELSE 2147483647
+                       END
+            AND (DB_NAME(d.database_id) = @DatabaseName OR @DatabaseName IS NULL)
+            AND (d.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (d.event_date < @EndDate OR @EndDate IS NULL)
+            AND (CONVERT(nvarchar(MAX), d.object_names) COLLATE Latin1_General_BIN2 LIKE N'%' + @ObjectName + N'%' OR @ObjectName IS NULL)
+            AND (d.client_app = @AppName OR @AppName IS NULL)
+            AND (d.host_name = @HostName OR @HostName IS NULL)
+            AND (d.login_name = @LoginName OR @LoginName IS NULL)
+            OPTION (RECOMPILE, LOOP JOIN, HASH JOIN);
+
+            UPDATE d
+                SET d.inputbuf =
+                        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                            d.inputbuf,
+                        NCHAR(31), N'?'), NCHAR(30), N'?'), NCHAR(29), N'?'), NCHAR(28), N'?'), NCHAR(27), N'?'),
+                        NCHAR(26), N'?'), NCHAR(25), N'?'), NCHAR(24), N'?'), NCHAR(23), N'?'), NCHAR(22), N'?'),
+                        NCHAR(21), N'?'), NCHAR(20), N'?'), NCHAR(19), N'?'), NCHAR(18), N'?'), NCHAR(17), N'?'),
+                        NCHAR(16), N'?'), NCHAR(15), N'?'), NCHAR(14), N'?'), NCHAR(12), N'?'), NCHAR(11), N'?'),
+                        NCHAR(8),  N'?'),  NCHAR(7), N'?'),  NCHAR(6), N'?'),  NCHAR(5), N'?'),  NCHAR(4), N'?'),
+                        NCHAR(3),  N'?'),  NCHAR(2), N'?'),  NCHAR(1), N'?'),  NCHAR(0), N'?')
+            FROM #deadlocks AS d
+            OPTION(RECOMPILE);
+
+            SELECT
+                d.deadlock_type,
+                d.event_date,
+                database_name =
+                    DB_NAME(d.database_id),
+                database_name_x =
+                    d.database_name,
+                d.current_database_name,
+                d.spid,
+                d.deadlock_group,
+                d.client_option_1,
+                d.client_option_2,
+                d.lock_mode,
+                query_xml =
+                    (
+                        SELECT
+                            [processing-instruction(query)] =
+                                d.inputbuf
+                        FOR XML
+                            PATH(N''),
+                            TYPE
+                    ),
+                query_string =
+                    d.inputbuf,
+                d.object_names,
+                d.isolation_level,
+                d.owner_mode,
+                d.waiter_mode,
+                d.transaction_count,
+                d.login_name,
+                d.host_name,
+                d.client_app,
+                d.wait_time,
+                d.wait_resource,
+                d.priority,
+                d.log_used,
+                d.last_tran_started,
+                d.last_batch_started,
+                d.last_batch_completed,
+                d.transaction_name,
+                d.status,
+                /*These columns will be NULL for regular (non-parallel) deadlocks*/
+                parallel_deadlock_details =
+                    (
+                        SELECT
+                            d.owner_waiter_type,
+                            d.owner_activity,
+                            d.owner_waiter_activity,
+                            d.owner_merging,
+                            d.owner_spilling,
+                            d.owner_waiting_to_close,
+                            d.waiter_waiter_type,
+                            d.waiter_owner_activity,
+                            d.waiter_waiter_activity,
+                            d.waiter_merging,
+                            d.waiter_spilling,
+                            d.waiter_waiting_to_close
+                        FOR XML
+                            PATH('parallel_deadlock_details'),
+                            TYPE
+                    ),
+                d.owner_waiter_type,
+                d.owner_activity,
+                d.owner_waiter_activity,
+                d.owner_merging,
+                d.owner_spilling,
+                d.owner_waiting_to_close,
+                d.waiter_waiter_type,
+                d.waiter_owner_activity,
+                d.waiter_waiter_activity,
+                d.waiter_merging,
+                d.waiter_spilling,
+                d.waiter_waiting_to_close,
+                /*end parallel deadlock columns*/
+                d.deadlock_graph,
+                d.is_victim
+            INTO #deadlock_results
+            FROM #deadlocks AS d;
+
+            IF @Debug = 1 BEGIN SET STATISTICS XML OFF; END;
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+            /*There's too much risk of errors sending the*/
+            IF @OutputDatabaseCheck = 0
+            BEGIN
+                SET @ExportToExcel = 0;
+            END;
+
+            SET @deadlock_result += N'
+            SELECT
+                server_name =
+                    @@SERVERNAME,
+                dr.deadlock_type,
+                dr.event_date,
+                database_name =
+                    COALESCE
+                    (
+                        dr.database_name,
+                        dr.database_name_x,
+                        dr.current_database_name
+                    ),
+                dr.spid,
+                dr.deadlock_group,
+                ' + CASE @ExportToExcel
+                         WHEN 1
+                         THEN N'
+                query = dr.query_string,
+                object_names =
+                    REPLACE(
+                    REPLACE(
+                        CONVERT
+                        (
+                            nvarchar(MAX),
+                            dr.object_names
+                        ) COLLATE Latin1_General_BIN2,
+                    ''<object>'', ''''),
+                    ''</object>'', ''''),'
+                         ELSE N'query = dr.query_xml,
+                dr.object_names,'
+                    END + N'
+                dr.isolation_level,
+                dr.owner_mode,
+                dr.waiter_mode,
+                dr.lock_mode,
+                dr.transaction_count,
+                dr.client_option_1,
+                dr.client_option_2,
+                dr.login_name,
+                dr.host_name,
+                dr.client_app,
+                dr.wait_time,
+                dr.wait_resource,
+                dr.priority,
+                dr.log_used,
+                dr.last_tran_started,
+                dr.last_batch_started,
+                dr.last_batch_completed,
+                dr.transaction_name,
+                dr.status,' +
+                    CASE
+                        WHEN (@ExportToExcel = 1
+                              OR @OutputDatabaseCheck = 0)
+                        THEN N'
+                dr.owner_waiter_type,
+                dr.owner_activity,
+                dr.owner_waiter_activity,
+                dr.owner_merging,
+                dr.owner_spilling,
+                dr.owner_waiting_to_close,
+                dr.waiter_waiter_type,
+                dr.waiter_owner_activity,
+                dr.waiter_waiter_activity,
+                dr.waiter_merging,
+                dr.waiter_spilling,
+                dr.waiter_waiting_to_close,'
+                        ELSE N'
+                dr.parallel_deadlock_details,'
+                        END +
+                    CASE
+                        @ExportToExcel
+                        WHEN 1
+                        THEN N'
+                deadlock_graph =
+                    REPLACE(REPLACE(
+                    REPLACE(REPLACE(
+                        CONVERT
+                        (
+                            nvarchar(MAX),
+                            dr.deadlock_graph
+                        ) COLLATE Latin1_General_BIN2,
+                    ''NCHAR(10)'', ''''), ''NCHAR(13)'', ''''),
+                    ''CHAR(10)'', ''''), ''CHAR(13)'', '''')'
+                        ELSE N'
+                dr.deadlock_graph'
+                   END + N'
+            FROM #deadlock_results AS dr
+            ORDER BY
+                dr.event_date,
+                dr.is_victim DESC
+            OPTION(RECOMPILE, LOOP JOIN, HASH JOIN);
+            ';
+
+        IF (@OutputDatabaseCheck = 0)
+        BEGIN
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Results to table %s', 0, 1, @d) WITH NOWAIT;
+
+            IF @Debug = 1
+            BEGIN
+                PRINT @deadlock_result;
+                SET STATISTICS XML ON;
+            END;
+
+            INSERT INTO
+                DeadLockTbl
+            (
+                ServerName,
+                deadlock_type,
+                event_date,
+                database_name,
+                spid,
+                deadlock_group,
+                query,
+                object_names,
+                isolation_level,
+                owner_mode,
+                waiter_mode,
+                lock_mode,
+                transaction_count,
+                client_option_1,
+                client_option_2,
+                login_name,
+                host_name,
+                client_app,
+                wait_time,
+                wait_resource,
+                priority,
+                log_used,
+                last_tran_started,
+                last_batch_started,
+                last_batch_completed,
+                transaction_name,
+                status,
+                owner_waiter_type,
+                owner_activity,
+                owner_waiter_activity,
+                owner_merging,
+                owner_spilling,
+                owner_waiting_to_close,
+                waiter_waiter_type,
+                waiter_owner_activity,
+                waiter_waiter_activity,
+                waiter_merging,
+                waiter_spilling,
+                waiter_waiting_to_close,
+                deadlock_graph
+            )
+            EXEC sys.sp_executesql
+                @deadlock_result;
+
+            IF @Debug = 1
+            BEGIN
+                SET STATISTICS XML OFF;
+            END;
+
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+            DROP SYNONYM DeadLockTbl;
+
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Findings to table %s', 0, 1, @d) WITH NOWAIT;
+
+            INSERT INTO
+                DeadlockFindings
+            (
+                ServerName,
+                check_id,
+                database_name,
+                object_name,
+                finding_group,
+                finding
+            )
+            SELECT
+                @@SERVERNAME,
+                df.check_id,
+                df.database_name,
+                df.object_name,
+                df.finding_group,
+                df.finding
+            FROM #deadlock_findings AS df
+            ORDER BY df.check_id
+            OPTION(RECOMPILE);
+
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+            DROP SYNONYM DeadlockFindings; /*done with inserting.*/
+        END;
+        ELSE /*Output to database is not set output to client app*/
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Results to client %s', 0, 1, @d) WITH NOWAIT;
+
+            IF @Debug = 1 BEGIN SET STATISTICS XML ON; END;
+
+            EXEC sys.sp_executesql
+                @deadlock_result;
+
+            IF @Debug = 1
+            BEGIN
+                SET STATISTICS XML OFF;
+                PRINT @deadlock_result;
+            END;
+
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Returning findings %s', 0, 1, @d) WITH NOWAIT;
+
+            SELECT
+                df.check_id,
+                df.database_name,
+                df.object_name,
+                df.finding_group,
+                df.finding
+            FROM #deadlock_findings AS df
+            ORDER BY df.check_id
+            OPTION(RECOMPILE);
+
+            SET @d = CONVERT(varchar(40), GETDATE(), 109);
+            RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+        END; /*done with output to client app.*/
 
         IF @Debug = 1
-            BEGIN
+        BEGIN
+            SELECT
+                table_name = N'#dd',
+                *
+            FROM #dd AS d
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_data' AS table_name, *
-                FROM   #deadlock_data AS dd
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlock_data',
+                *
+            FROM #deadlock_data AS dd
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_resource' AS table_name, *
-                FROM   #deadlock_resource AS dr
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlock_resource',
+                *
+            FROM #deadlock_resource AS dr
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_resource_parallel' AS table_name, *
-                FROM   #deadlock_resource_parallel AS drp
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlock_resource_parallel',
+                *
+            FROM #deadlock_resource_parallel AS drp
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_owner_waiter' AS table_name, *
-                FROM   #deadlock_owner_waiter AS dow
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlock_owner_waiter',
+                *
+            FROM #deadlock_owner_waiter AS dow
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_process' AS table_name, *
-                FROM   #deadlock_process AS dp
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlock_process',
+                *
+            FROM #deadlock_process AS dp
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_stack' AS table_name, *
-                FROM   #deadlock_stack AS ds
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlock_stack',
+                *
+            FROM #deadlock_stack AS ds
+            OPTION(RECOMPILE);
 
-                SELECT '#deadlock_results' AS table_name, *
-                FROM   #deadlock_results AS dr
-				OPTION ( RECOMPILE );
+            SELECT
+                table_name = N'#deadlocks',
+                *
+            FROM #deadlocks AS d
+            OPTION(RECOMPILE);
 
-            END; -- End debug
+            SELECT
+                table_name = N'#deadlock_results',
+                *
+            FROM #deadlock_results AS dr
+            OPTION(RECOMPILE);
 
-    END; --Final End
+            SELECT
+                table_name = N'#x',
+                *
+            FROM #x AS x
+            OPTION(RECOMPILE);
+
+            SELECT
+                table_name = N'@sysAssObjId',
+                *
+            FROM @sysAssObjId AS s
+            OPTION(RECOMPILE);
+
+        END; /*End debug*/
+    END; /*Final End*/
 
 GO
 SET ANSI_NULLS ON;
@@ -30100,7 +32402,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 IF(@VersionCheckMode = 1)
 BEGIN
 	RETURN;
@@ -30186,7 +32488,7 @@ IF @Help = 1
 	
 	MIT License
 	
-	Copyright (c) 2021 Brent Ozar Unlimited
+	Copyright (c) Brent Ozar Unlimited
 	
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -32349,7 +34651,7 @@ RAISERROR(N'Gathering working plans', 0, 1) WITH NOWAIT;
 SET @sql_select = N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;';
 SET @sql_select += N'
 SELECT ' + QUOTENAME(@DatabaseName, '''') + N' AS database_name,  wp.plan_id, wp.query_id,
-	   qsp.plan_group_id, qsp.engine_version, qsp.compatibility_level, qsp.query_plan_hash, TRY_CONVERT(XML, qsp.query_plan), qsp.is_online_index_plan, qsp.is_trivial_plan, 
+	   qsp.plan_group_id, qsp.engine_version, qsp.compatibility_level, qsp.query_plan_hash, TRY_CAST(qsp.query_plan AS XML), qsp.is_online_index_plan, qsp.is_trivial_plan, 
 	   qsp.is_parallel_plan, qsp.is_forced_plan, qsp.is_natively_compiled, qsp.force_failure_count, qsp.last_force_failure_reason_desc, qsp.count_compiles, 
 	   qsp.initial_compile_start_time, qsp.last_compile_start_time, qsp.last_execution_time, 
 	   (qsp.avg_compile_duration / 1000.), 
@@ -35831,7 +38133,7 @@ BEGIN
 	SET STATISTICS XML OFF;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
-	SELECT @Version = '8.11', @VersionDate = '20221013';
+	SELECT @Version = '8.13', @VersionDate = '20230215';
     
 	IF(@VersionCheckMode = 1)
 	BEGIN
@@ -35859,7 +38161,7 @@ Known limitations of this version:
    
 MIT License
 
-Copyright (c) 2021 Brent Ozar Unlimited
+Copyright (c) Brent Ozar Unlimited
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -36476,13 +38778,23 @@ BEGIN
     */
     SET @StringToExecute = N'COALESCE( RIGHT(''00'' + CONVERT(VARCHAR(20), (ABS(r.total_elapsed_time) / 1000) / 86400), 2) + '':'' + CONVERT(VARCHAR(20), (DATEADD(SECOND, (r.total_elapsed_time / 1000), 0) + DATEADD(MILLISECOND, (r.total_elapsed_time % 1000), 0)), 114), RIGHT(''00'' + CONVERT(VARCHAR(20), DATEDIFF(SECOND, s.last_request_start_time, GETDATE()) / 86400), 2) + '':'' + CONVERT(VARCHAR(20), DATEADD(SECOND, DATEDIFF(SECOND, s.last_request_start_time, GETDATE()), 0), 114) ) AS [elapsed_time] ,
 			       s.session_id ,
+					CASE WHEN r.blocking_session_id <> 0 AND blocked.session_id IS NULL 
+							THEN r.blocking_session_id
+							WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
+							THEN blocked.blocking_session_id
+							WHEN r.blocking_session_id = 0 AND s.session_id = blocked.session_id 
+							THEN blocked.blocking_session_id
+							WHEN r.blocking_session_id <> 0 AND s.session_id = blocked.blocking_session_id 
+							THEN r.blocking_session_id
+							ELSE NULL 
+						END AS blocking_session_id,
 						    COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid), ''N/A'') AS database_name,
 			       ISNULL(SUBSTRING(dest.text,
-			            ( query_stats.statement_start_offset / 2 ) + 1,
-			            ( ( CASE query_stats.statement_end_offset
+			            ( r.statement_start_offset / 2 ) + 1,
+			            ( ( CASE r.statement_end_offset
 			               WHEN -1 THEN DATALENGTH(dest.text)
-			               ELSE query_stats.statement_end_offset
-			             END - query_stats.statement_start_offset )
+			               ELSE r.statement_end_offset
+			             END - r.statement_start_offset )
 			              / 2 ) + 1), dest.text) AS query_text ,
 						  '+CASE
 								WHEN @GetOuterCommand = 1 THEN N'CAST(event_info AS NVARCHAR(4000)) AS outer_command,'
@@ -36496,16 +38808,6 @@ BEGIN
 								ELSE NULL
 							END AS wait_info ,																					
 							r.wait_resource ,
-						    CASE WHEN r.blocking_session_id <> 0 AND blocked.session_id IS NULL 
-							       THEN r.blocking_session_id
-							       WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
-							       THEN blocked.blocking_session_id
-								   WHEN r.blocking_session_id = 0 AND s.session_id = blocked.session_id 
-								   THEN blocked.blocking_session_id
-								   WHEN r.blocking_session_id <> 0 AND s.session_id = blocked.blocking_session_id 
-							       THEN r.blocking_session_id
-							       ELSE NULL 
-						      END AS blocking_session_id,
 			       COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
 						    CASE WHEN EXISTS (  SELECT 1 
                FROM sys.dm_tran_active_transactions AS tat
@@ -36657,7 +38959,7 @@ BEGIN
 				OUTER APPLY sys.dm_exec_sql_text(COALESCE(r.sql_handle, blocked.sql_handle)) AS dest
 			 OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) AS derp
 				OUTER APPLY (
-						SELECT CONVERT(DECIMAL(38,2), SUM( (((tsu.user_objects_alloc_page_count - user_objects_dealloc_page_count) * 8) / 1024.)) ) AS tempdb_allocations_mb
+						SELECT CONVERT(DECIMAL(38,2), SUM( ((((tsu.user_objects_alloc_page_count - user_objects_dealloc_page_count) + (tsu.internal_objects_alloc_page_count - internal_objects_dealloc_page_count)) * 8) / 1024.)) ) AS tempdb_allocations_mb
 						FROM sys.dm_db_task_space_usage tsu
 						WHERE tsu.request_id = r.request_id
 						AND tsu.session_id = r.session_id
@@ -36694,13 +38996,23 @@ IF @ProductVersionMajor >= 11
     */
     SELECT @StringToExecute = N'COALESCE( RIGHT(''00'' + CONVERT(VARCHAR(20), (ABS(r.total_elapsed_time) / 1000) / 86400), 2) + '':'' + CONVERT(VARCHAR(20), (DATEADD(SECOND, (r.total_elapsed_time / 1000), 0) + DATEADD(MILLISECOND, (r.total_elapsed_time % 1000), 0)), 114), RIGHT(''00'' + CONVERT(VARCHAR(20), DATEDIFF(SECOND, s.last_request_start_time, GETDATE()) / 86400), 2) + '':'' + CONVERT(VARCHAR(20), DATEADD(SECOND, DATEDIFF(SECOND, s.last_request_start_time, GETDATE()), 0), 114) ) AS [elapsed_time] ,
 			       s.session_id ,
-						    COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid), ''N/A'') AS database_name,
-			       ISNULL(SUBSTRING(dest.text,
-			            ( query_stats.statement_start_offset / 2 ) + 1,
-			            ( ( CASE query_stats.statement_end_offset
+					CASE WHEN r.blocking_session_id <> 0 AND blocked.session_id IS NULL 
+					THEN r.blocking_session_id
+					WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
+					THEN blocked.blocking_session_id
+					WHEN r.blocking_session_id = 0 AND s.session_id = blocked.session_id 
+					THEN blocked.blocking_session_id
+					WHEN r.blocking_session_id <> 0 AND s.session_id = blocked.blocking_session_id 
+					THEN r.blocking_session_id
+					ELSE NULL 
+					END AS blocking_session_id,
+					COALESCE(DB_NAME(r.database_id), DB_NAME(blocked.dbid), ''N/A'') AS database_name,
+					ISNULL(SUBSTRING(dest.text,
+			            ( r.statement_start_offset / 2 ) + 1,
+			            ( ( CASE r.statement_end_offset
 			               WHEN -1 THEN DATALENGTH(dest.text)
-			               ELSE query_stats.statement_end_offset
-			             END - query_stats.statement_start_offset )
+			               ELSE r.statement_end_offset
+			             END - r.statement_start_offset )
 			              / 2 ) + 1), dest.text) AS query_text ,
 						  '+CASE
 								WHEN @GetOuterCommand = 1 THEN N'CAST(event_info AS NVARCHAR(4000)) AS outer_command,'
@@ -36739,17 +39051,7 @@ IF @ProductVersionMajor >= 11
 							     ELSE N' NULL AS top_session_waits ,'
 						    END
 						    +																	
-						    N'CASE WHEN r.blocking_session_id <> 0 AND blocked.session_id IS NULL 
-							       THEN r.blocking_session_id
-							       WHEN r.blocking_session_id <> 0 AND s.session_id <> blocked.blocking_session_id 
-							       THEN blocked.blocking_session_id
-								   WHEN r.blocking_session_id = 0 AND s.session_id = blocked.session_id 
-								   THEN blocked.blocking_session_id
-								   WHEN r.blocking_session_id <> 0 AND s.session_id = blocked.blocking_session_id 
-							       THEN r.blocking_session_id
-							       ELSE NULL 
-						      END AS blocking_session_id,
-			       COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
+						    N'COALESCE(r.open_transaction_count, blocked.open_tran) AS open_transaction_count ,
 						    CASE WHEN EXISTS (  SELECT 1 
                FROM sys.dm_tran_active_transactions AS tat
                JOIN sys.dm_tran_session_transactions AS tst
@@ -36950,7 +39252,7 @@ IF @ProductVersionMajor >= 11
 	    OUTER APPLY sys.dm_exec_sql_text(COALESCE(r.sql_handle, blocked.sql_handle)) AS dest
 	    OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) AS derp
 	    OUTER APPLY (
-			    SELECT CONVERT(DECIMAL(38,2), SUM( (((tsu.user_objects_alloc_page_count - user_objects_dealloc_page_count) * 8) / 1024.)) ) AS tempdb_allocations_mb
+			    SELECT CONVERT(DECIMAL(38,2), SUM( ((((tsu.user_objects_alloc_page_count - user_objects_dealloc_page_count) + (tsu.internal_objects_alloc_page_count - internal_objects_dealloc_page_count)) * 8) / 1024.)) ) AS tempdb_allocations_mb
 			    FROM sys.dm_db_task_space_usage tsu
 			    WHERE tsu.request_id = r.request_id
 			    AND tsu.session_id = r.session_id
@@ -37053,6 +39355,7 @@ IF @OutputDatabaseName IS NOT NULL AND @OutputSchemaName IS NOT NULL AND @Output
 	,CheckDate
 	,[elapsed_time]
 	,[session_id]
+	,[blocking_session_id]
 	,[database_name]
 	,[query_text]'
 	+ CASE WHEN @GetOuterCommand = 1 THEN N',[outer_command]' ELSE N'' END + N'
@@ -37065,7 +39368,6 @@ IF @OutputDatabaseName IS NOT NULL AND @OutputSchemaName IS NOT NULL AND @Output
 	,[wait_info]
 	,[wait_resource]'
     + CASE WHEN @ProductVersionMajor >= 11 THEN N',[top_session_waits]' ELSE N'' END + N'
-	,[blocking_session_id]
 	,[open_transaction_count]
 	,[is_implicit_transaction]
 	,[nt_domain]
@@ -37228,7 +39530,7 @@ SET STATISTICS XML OFF;
 
 /*Versioning details*/
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -37260,7 +39562,7 @@ BEGIN
 		
 		MIT License
 			
-		Copyright (c) 2021 Brent Ozar Unlimited
+		Copyright (c) Brent Ozar Unlimited
 		
 		Permission is hereby granted, free of charge, to any person obtaining a copy
 		of this software and associated documentation files (the "Software"), to deal
@@ -37538,6 +39840,9 @@ CREATE TABLE #Headers
     KeyAlgorithm NVARCHAR(32),
     EncryptorThumbprint VARBINARY(20),
     EncryptorType NVARCHAR(32),
+	LastValidRestoreTime DATETIME, 
+	TimeZone NVARCHAR(256), 
+	CompressionAlgorithm NVARCHAR(256),
     --
     -- Seq added to retain order by
     --
@@ -37707,6 +40012,9 @@ IF @MajorVersion >= 11
 IF @MajorVersion >= 13 OR (@MajorVersion = 12 AND @BuildVersion >= 2342)
   SET @HeadersSQL += N', KeyAlgorithm, EncryptorThumbprint, EncryptorType';
 
+IF @MajorVersion >= 16
+  SET @HeadersSQL += N', LastValidRestoreTime, TimeZone, CompressionAlgorithm';
+
 SET @HeadersSQL += N')' + NCHAR(13) + NCHAR(10);
 SET @HeadersSQL += N'EXEC (''RESTORE HEADERONLY FROM DISK=''''{Path}'''''')';
 
@@ -37822,15 +40130,19 @@ BEGIN
 	/*End folder sanity check*/
 
 	IF @StopAt IS NOT NULL
-	BEGIN
-		DELETE
-		FROM @FileList
-		WHERE BackupFile LIKE N'%.bak'
-			AND
-			BackupFile LIKE N'%' + @Database + N'%'
-			AND
-			(REPLACE( RIGHT( REPLACE( BackupFile, RIGHT( BackupFile, PATINDEX( '%_[0-9][0-9]%', REVERSE( BackupFile ) ) ), '' ), 16 ), '_', '' ) > @StopAt);
-	END
+		BEGIN
+			DELETE
+			FROM @FileList
+			WHERE BackupFile LIKE N'%[_][0-9].bak'
+			AND	BackupFile LIKE N'%' + @Database + N'%'
+			AND	(REPLACE( RIGHT( REPLACE( BackupFile, RIGHT( BackupFile, PATINDEX( '%_[0-9][0-9]%', REVERSE( BackupFile ) ) ), '' ), 16 ), '_', '' ) > @StopAt);
+
+			DELETE
+			FROM @FileList
+			WHERE BackupFile LIKE N'%[_][0-9][0-9].bak'
+			AND	BackupFile LIKE N'%' + @Database + N'%'
+			AND	(REPLACE( RIGHT( REPLACE( BackupFile, RIGHT( BackupFile, PATINDEX( '%_[0-9][0-9]%', REVERSE( BackupFile ) ) ), '' ), 18 ), '_', '' ) > @StopAt);
+		END;
 	
     -- Find latest full backup 
     SELECT @LastFullBackup = MAX(BackupFile)
@@ -38794,7 +41106,7 @@ BEGIN
   SET NOCOUNT ON;
   SET STATISTICS XML OFF;
 
-  SELECT @Version = '8.11', @VersionDate = '20221013';
+  SELECT @Version = '8.13', @VersionDate = '20230215';
   
   IF(@VersionCheckMode = 1)
   BEGIN
@@ -38827,7 +41139,7 @@ BEGIN
 		
 		    MIT License
 			
-			Copyright (c) 2021 Brent Ozar Unlimited
+			Copyright (c) Brent Ozar Unlimited
 		
 			Permission is hereby granted, free of charge, to any person obtaining a copy
 			of this software and associated documentation files (the "Software"), to deal
@@ -39140,7 +41452,9 @@ DELETE FROM dbo.SqlServerVersions;
 INSERT INTO dbo.SqlServerVersions
     (MajorVersionNumber, MinorVersionNumber, Branch, [Url], ReleaseDate, MainstreamSupportEndDate, ExtendedSupportEndDate, MajorVersionName, MinorVersionName)
 VALUES
-    (16, 600, 'CTP2', 'https://support.microsoft.com/en-us/help/5011644', '2022-05-24', '2022-05-24', '2022-05-24', 'SQL Server 2022', 'CTP 2.0'),
+    (16, 1050, 'RTM GDR', 'https://support.microsoft.com/kb/5021522', '2023-02-14', '2028-01-11', '2033-01-11', 'SQL Server 2022 GDR', 'RTM'),
+    (16, 1000, 'RTM', '', '2022-11-15', '2028-01-11', '2033-01-11', 'SQL Server 2022', 'RTM'),
+    (15, 4280, 'CU18 GDR', 'https://support.microsoft.com/kb/5021124', '2023-02-14', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'Cumulative Update 18 GDR'),
     (15, 4261, 'CU18', 'https://support.microsoft.com/en-us/help/5017593', '2022-09-28', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'Cumulative Update 18'),
     (15, 4249, 'CU17', 'https://support.microsoft.com/en-us/help/5016394', '2022-08-11', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'Cumulative Update 17'),
     (15, 4236, 'CU16 GDR', 'https://support.microsoft.com/en-us/help/5014353', '2022-06-14', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'Cumulative Update 16 GDR'),
@@ -39163,6 +41477,7 @@ VALUES
     (15, 4003, 'CU1', 'https://support.microsoft.com/en-us/help/4527376', '2020-01-07', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'Cumulative Update 1 '),
     (15, 2070, 'GDR', 'https://support.microsoft.com/en-us/help/4517790', '2019-11-04', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'RTM GDR '),
     (15, 2000, 'RTM ', '', '2019-11-04', '2025-01-07', '2030-01-08', 'SQL Server 2019', 'RTM '),
+    (14, 3460, 'RTM CU31 GDR', 'https://support.microsoft.com/kb/5021126', '2023-02-14', '2022-10-11', '2027-10-12', 'SQL Server 2017', 'RTM Cumulative Update 31 GDR'),
     (14, 3456, 'RTM CU31', 'https://support.microsoft.com/en-us/help/5016884', '2022-09-20', '2022-10-11', '2027-10-12', 'SQL Server 2017', 'RTM Cumulative Update 31'),
     (14, 3451, 'RTM CU30', 'https://support.microsoft.com/en-us/help/5013756', '2022-07-13', '2022-10-11', '2027-10-12', 'SQL Server 2017', 'RTM Cumulative Update 30'),
     (14, 3445, 'RTM CU29 GDR', 'https://support.microsoft.com/en-us/help/5014553', '2022-06-14', '2022-10-11', '2027-10-12', 'SQL Server 2017', 'RTM Cumulative Update 29 GDR'),
@@ -39199,6 +41514,7 @@ VALUES
     (14, 1000, 'RTM ', '', '2017-10-02', '2022-10-11', '2027-10-12', 'SQL Server 2017', 'RTM '),
     (13, 7016, 'SP3 Azure Feature Pack GDR', 'https://support.microsoft.com/en-us/help/5015371', '2022-06-14', '2021-07-13', '2026-07-14', 'SQL Server 2016', 'Service Pack 3 Azure Feature Pack GDR'),
     (13, 7000, 'SP3 Azure Feature Pack', 'https://support.microsoft.com/en-us/help/5014242', '2022-05-19', '2021-07-13', '2026-07-14', 'SQL Server 2016', 'Service Pack 3 Azure Feature Pack'),
+    (13, 6430, 'SP3 GDR', 'https://support.microsoft.com/kb/5021129', '2023-02-14', '2021-07-13', '2026-07-14', 'SQL Server 2016', 'Service Pack 3 GDR'),
     (13, 6419, 'SP3 GDR', 'https://support.microsoft.com/en-us/help/5014355', '2022-06-14', '2021-07-13', '2026-07-14', 'SQL Server 2016', 'Service Pack 3 GDR'),
     (13, 6404, 'SP3 GDR', 'https://support.microsoft.com/en-us/help/5006943', '2021-10-27', '2021-07-13', '2026-07-14', 'SQL Server 2016', 'Service Pack 3 GDR'),
     (13, 6300, 'SP3 ', 'https://support.microsoft.com/en-us/help/5003279', '2021-09-15', '2021-07-13', '2026-07-14', 'SQL Server 2016', 'Service Pack 3'),
@@ -39250,6 +41566,7 @@ VALUES
     (13, 2164, 'RTM CU2', 'https://support.microsoft.com/en-us/help/3182270 ', '2016-09-22', '2018-01-09', '2018-01-09', 'SQL Server 2016', 'RTM Cumulative Update 2'),
     (13, 2149, 'RTM CU1', 'https://support.microsoft.com/en-us/help/3164674 ', '2016-07-25', '2018-01-09', '2018-01-09', 'SQL Server 2016', 'RTM Cumulative Update 1'),
     (13, 1601, 'RTM ', '', '2016-06-01', '2019-01-09', '2019-01-09', 'SQL Server 2016', 'RTM '),
+    (12, 6444, 'SP3 CU4 GDR', 'https://support.microsoft.com/kb/5021045', '2023-02-14', '2019-07-09', '2024-07-09', 'SQL Server 2014', 'Service Pack 3 Cumulative Update 4 GDR'),
     (12, 6439, 'SP3 CU4 GDR', 'https://support.microsoft.com/en-us/help/5014164', '2022-06-14', '2019-07-09', '2024-07-09', 'SQL Server 2014', 'Service Pack 3 Cumulative Update 4 GDR'),
     (12, 6433, 'SP3 CU4 GDR', 'https://support.microsoft.com/en-us/help/4583462', '2021-01-12', '2019-07-09', '2024-07-09', 'SQL Server 2014', 'Service Pack 3 Cumulative Update 4 GDR'),
     (12, 6372, 'SP3 CU4 GDR', 'https://support.microsoft.com/en-us/help/4535288', '2020-02-11', '2019-07-09', '2024-07-09', 'SQL Server 2014', 'Service Pack 3 Cumulative Update 4 GDR'),
@@ -39556,7 +41873,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -39596,7 +41913,7 @@ https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
 
 MIT License
 
-Copyright (c) 2021 Brent Ozar Unlimited
+Copyright (c) Brent Ozar Unlimited
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -40641,7 +42958,7 @@ BEGIN
            @StockDetailsFooter = @StockDetailsFooter + @LineFeed + ' -- ?>';
 
     /* Get the instance name to use as a Perfmon counter prefix. */
-    IF SERVERPROPERTY('EngineEdition') = 5 /*CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'*/
+    IF SERVERPROPERTY('EngineEdition') IN (5, 8) /*CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'*/
         SELECT TOP 1 @ServiceName = LEFT(object_name, (CHARINDEX(':', object_name) - 1))
         FROM sys.dm_os_performance_counters;
     ELSE
@@ -41803,8 +44120,9 @@ If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
 				  CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) AS qp ';
 
 				IF EXISTS (SELECT * FROM sys.all_objects WHERE name = 'dm_exec_query_statistics_xml')
-					SET @StringToExecute = @StringToExecute + N' OUTER APPLY sys.dm_exec_query_statistics_xml(s.session_id) qs_live ';
-				  
+				/* GitHub #3210 */
+					SET @StringToExecute = N'
+                   SET LOCK_TIMEOUT 1000 ' + @StringToExecute + N' OUTER APPLY sys.dm_exec_query_statistics_xml(s.session_id) qs_live ';
 				  
 				SET @StringToExecute = @StringToExecute + N';
 
@@ -42026,7 +44344,23 @@ If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
                                     ;
 
 			IF SERVERPROPERTY('EngineEdition') <> 5 /*SERVERPROPERTY('Edition') <> 'SQL Azure'*/
-	            EXEC sp_MSforeachdb @StringToExecute;
+			BEGIN
+				BEGIN TRY
+					EXEC sp_MSforeachdb @StringToExecute;
+				END TRY
+				BEGIN CATCH
+					IF (ERROR_NUMBER() = 1222)
+					BEGIN
+						INSERT INTO #UpdatedStats(HowToStopIt, RowsForSorting)
+						SELECT HowToStopIt = N'No information could be retrieved as the lock timeout was exceeded while iterating databases,' +
+											 N' this is likely due to an Index operation in Progress', -1;
+					END
+					ELSE
+					BEGIN
+						THROW;
+					END
+				END CATCH
+			END
 			ELSE
 				EXEC(@StringToExecute);
 

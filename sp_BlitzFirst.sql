@@ -46,7 +46,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.11', @VersionDate = '20221013';
+SELECT @Version = '8.13', @VersionDate = '20230215';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -86,7 +86,7 @@ https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
 
 MIT License
 
-Copyright (c) 2021 Brent Ozar Unlimited
+Copyright (c) Brent Ozar Unlimited
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -1131,7 +1131,7 @@ BEGIN
            @StockDetailsFooter = @StockDetailsFooter + @LineFeed + ' -- ?>';
 
     /* Get the instance name to use as a Perfmon counter prefix. */
-    IF SERVERPROPERTY('EngineEdition') = 5 /*CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'*/
+    IF SERVERPROPERTY('EngineEdition') IN (5, 8) /*CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'*/
         SELECT TOP 1 @ServiceName = LEFT(object_name, (CHARINDEX(':', object_name) - 1))
         FROM sys.dm_os_performance_counters;
     ELSE
@@ -2163,7 +2163,7 @@ If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
                    FROM (
                          SELECT deqp.session_id,
                                 deqp.request_id,
-                                CASE WHEN deqp.row_count > ( deqp.estimate_row_count * 10000 )
+                                CASE WHEN (deqp.row_count/10000) > deqp.estimate_row_count
                                      THEN 1
                                      ELSE 0
                                 END AS estimate_inaccuracy
@@ -2293,8 +2293,9 @@ If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
 				  CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) AS qp ';
 
 				IF EXISTS (SELECT * FROM sys.all_objects WHERE name = 'dm_exec_query_statistics_xml')
-					SET @StringToExecute = @StringToExecute + N' OUTER APPLY sys.dm_exec_query_statistics_xml(s.session_id) qs_live ';
-				  
+				/* GitHub #3210 */
+					SET @StringToExecute = N'
+                   SET LOCK_TIMEOUT 1000 ' + @StringToExecute + N' OUTER APPLY sys.dm_exec_query_statistics_xml(s.session_id) qs_live ';
 				  
 				SET @StringToExecute = @StringToExecute + N';
 
@@ -2516,7 +2517,23 @@ If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
                                     ;
 
 			IF SERVERPROPERTY('EngineEdition') <> 5 /*SERVERPROPERTY('Edition') <> 'SQL Azure'*/
-	            EXEC sp_MSforeachdb @StringToExecute;
+			BEGIN
+				BEGIN TRY
+					EXEC sp_MSforeachdb @StringToExecute;
+				END TRY
+				BEGIN CATCH
+					IF (ERROR_NUMBER() = 1222)
+					BEGIN
+						INSERT INTO #UpdatedStats(HowToStopIt, RowsForSorting)
+						SELECT HowToStopIt = N'No information could be retrieved as the lock timeout was exceeded while iterating databases,' +
+											 N' this is likely due to an Index operation in Progress', -1;
+					END
+					ELSE
+					BEGIN
+						THROW;
+					END
+				END CATCH
+			END
 			ELSE
 				EXEC(@StringToExecute);
 
@@ -3129,7 +3146,7 @@ If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
 
 	/* Check for temp objects with high forwarded fetches.
 		This has to be done as dynamic SQL because we have to execute OBJECT_NAME inside TempDB. */
-	IF @@ROWCOUNT > 0
+	IF EXISTS (SELECT * FROM #BlitzFirstResults WHERE CheckID = 29)
 		BEGIN
 		SET @StringToExecute = N'
 		INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt)

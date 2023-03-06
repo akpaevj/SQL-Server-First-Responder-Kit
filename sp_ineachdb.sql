@@ -35,7 +35,7 @@ BEGIN
   SET NOCOUNT ON;
   SET STATISTICS XML OFF;
 
-  SELECT @Version = '8.11', @VersionDate = '20221013';
+  SELECT @Version = '8.13', @VersionDate = '20230215';
   
   IF(@VersionCheckMode = 1)
   BEGIN
@@ -68,7 +68,7 @@ BEGIN
 		
 		    MIT License
 			
-			Copyright (c) 2021 Brent Ozar Unlimited
+			Copyright (c) Brent Ozar Unlimited
 		
 			Permission is hereby granted, free of charge, to any person obtaining a copy
 			of this software and associated documentation files (the "Software"), to deal
