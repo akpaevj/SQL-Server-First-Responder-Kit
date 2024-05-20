@@ -38,7 +38,7 @@ AS
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
 
-	SELECT @Version = '8.13', @VersionDate = '20230215';
+	SELECT @Version = '8.19', @VersionDate = '20240222';
 	SET @OutputType = UPPER(@OutputType);
 
     IF(@VersionCheckMode = 1)
@@ -85,6 +85,7 @@ AS
 	@OutputType					''TABLE''=table | ''COUNT''=row with number found | ''MARKDOWN''=bulleted list (including server info, excluding security findings) | ''SCHEMA''=version and field list | ''XML'' =table output as XML | ''NONE'' = none
 	@IgnorePrioritiesBelow		50=ignore priorities below 50
 	@IgnorePrioritiesAbove		50=ignore priorities above 50
+	@Debug						0=silent (Default) | 1=messages per step | 2=outputs dynamic queries
 	For the rest of the parameters, see https://www.BrentOzar.com/blitz/documentation for details.
 
     MIT License
@@ -186,10 +187,253 @@ AS
             ,@CurrentComponentVersionCheckModeOK     BIT
             ,@canExitLoop                            BIT
             ,@frkIsConsistent                        BIT
-			,@NeedToTurnNumericRoundabortBackOn      BIT;
+			,@NeedToTurnNumericRoundabortBackOn      BIT
+			,@sa bit = 1
+			,@SUSER_NAME sysname = SUSER_SNAME()
+			,@SkipDBCC bit = 0
+			,@SkipTrace bit = 0
+			,@SkipXPRegRead bit = 0
+			,@SkipXPFixedDrives bit = 0
+			,@SkipXPCMDShell bit = 0
+			,@SkipMaster bit = 0
+			,@SkipMSDB_objs bit = 0
+            ,@SkipMSDB_jobs bit = 0
+			,@SkipModel bit = 0
+			,@SkipTempDB bit = 0
+			,@SkipValidateLogins bit = 0
+      ,@SkipGetAlertInfo bit = 0
+
+			DECLARE
+			    @db_perms table
+            (
+			    database_name sysname,
+				permission_name sysname
+			);
+
+			INSERT
+			    @db_perms
+			(
+			    database_name,
+			    permission_name
+			)
+            SELECT
+                database_name =
+				    DB_NAME(d.database_id),
+                fmp.permission_name
+            FROM sys.databases AS d
+            CROSS APPLY fn_my_permissions(d.name, 'DATABASE') AS fmp
+            WHERE fmp.permission_name = N'SELECT'; /*Databases where we don't have read permissions*/
             
             /* End of declarations for First Responder Kit consistency check:*/
         ;
+
+        /* Create temp table for check 73 */
+        IF OBJECT_ID('tempdb..#AlertInfo') IS NOT NULL
+			EXEC sp_executesql N'DROP TABLE #AlertInfo;';
+
+        CREATE TABLE #AlertInfo
+		(
+		    FailSafeOperator NVARCHAR(255) ,
+		    NotificationMethod INT ,
+		    ForwardingServer NVARCHAR(255) ,
+		    ForwardingSeverity INT ,
+		    PagerToTemplate NVARCHAR(255) ,
+		    PagerCCTemplate NVARCHAR(255) ,
+		    PagerSubjectTemplate NVARCHAR(255) ,
+		    PagerSendSubjectOnly NVARCHAR(255) ,
+		    ForwardAlways INT
+		);
+
+		/* Create temp table for check 2301 */
+		IF OBJECT_ID('tempdb..#InvalidLogins') IS NOT NULL
+			EXEC sp_executesql N'DROP TABLE #InvalidLogins;';
+								 
+		CREATE TABLE #InvalidLogins
+		(
+			LoginSID    varbinary(85),
+			LoginName   VARCHAR(256)
+		);
+
+		/*Starting permissions checks here, but only if we're not a sysadmin*/
+		IF
+        (
+            SELECT 
+                sa = 
+                    ISNULL
+                    (
+                        IS_SRVROLEMEMBER(N'sysadmin'), 
+                        0
+                    )
+        ) = 0
+        BEGIN
+			IF @Debug IN (1, 2) RAISERROR('User not SA, checking permissions', 0, 1) WITH NOWAIT;
+		    
+			SET @sa = 0; /*Setting this to 0 to skip DBCC COMMANDS*/
+
+		    IF NOT EXISTS
+		    (
+		        SELECT 
+                    1/0 
+                FROM sys.fn_my_permissions(NULL, NULL) AS fmp 
+                WHERE fmp.permission_name = N'VIEW SERVER STATE'
+		    )
+			BEGIN
+			    RAISERROR('The user %s does not have VIEW SERVER STATE permissions.', 0, 11, @SUSER_NAME) WITH NOWAIT;
+				RETURN;
+			END; /*If we don't have this, we can't do anything at all.*/
+
+            IF NOT EXISTS
+            (
+                SELECT
+                    1/0
+                FROM fn_my_permissions(N'sys.traces', N'OBJECT') AS fmp
+                WHERE fmp.permission_name = N'ALTER'
+            )
+            BEGIN
+                SET @SkipTrace = 1;
+            END; /*We need this permission to execute trace stuff, apparently*/
+
+            IF NOT EXISTS
+            (
+                SELECT
+                    1/0
+                FROM fn_my_permissions(N'xp_fixeddrives', N'OBJECT') AS fmp
+                WHERE fmp.permission_name = N'EXECUTE'
+            )
+            BEGIN
+                SET @SkipXPFixedDrives = 1;
+            END; /*Need execute on xp_fixeddrives*/
+
+            IF NOT EXISTS
+            (
+                SELECT
+                    1/0
+                FROM fn_my_permissions(N'xp_cmdshell', N'OBJECT') AS fmp
+                WHERE fmp.permission_name = N'EXECUTE'
+            )
+            BEGIN
+                SET @SkipXPCMDShell = 1;
+            END; /*Need execute on xp_cmdshell*/
+
+			IF ISNULL(@SkipValidateLogins, 0) != 1 /*If @SkipValidateLogins hasn't been set to 1 by the caller*/
+			BEGIN
+			    BEGIN TRY
+			        /* Try to fill the table for check 2301 */
+					INSERT INTO #InvalidLogins
+			    	(
+			    		[LoginSID]
+			    		,[LoginName]
+			    	)
+			    	EXEC sp_validatelogins;
+			
+			    	SET @SkipValidateLogins = 0; /*We can execute sp_validatelogins*/
+			    END TRY
+			    BEGIN CATCH
+			    	SET @SkipValidateLogins = 1; /*We have don't have execute rights or sp_validatelogins throws an error so skip it*/
+			    END CATCH;
+			END; /*Need execute on sp_validatelogins*/
+            
+            IF ISNULL(@SkipGetAlertInfo, 0) != 1 /*If @SkipGetAlertInfo hasn't been set to 1 by the caller*/
+			BEGIN
+			    BEGIN TRY
+			        /* Try to fill the table for check 73 */
+					INSERT INTO #AlertInfo
+                    EXEC [master].[dbo].[sp_MSgetalertinfo] @includeaddresses = 0;
+			
+			    	SET @SkipGetAlertInfo = 0; /*We can execute sp_MSgetalertinfo*/
+			    END TRY
+			    BEGIN CATCH
+			    	SET @SkipGetAlertInfo = 1; /*We have don't have execute rights or sp_MSgetalertinfo throws an error so skip it*/
+			    END CATCH;
+			END; /*Need execute on sp_MSgetalertinfo*/
+
+			IF ISNULL(@SkipModel, 0) != 1 /*If @SkipModel hasn't been set to 1 by the caller*/
+			BEGIN
+				IF EXISTS
+            	(
+            	    SELECT 1/0
+            	    FROM @db_perms
+            	    WHERE database_name = N'model'
+            	)
+            	BEGIN
+            	    BEGIN TRY
+            	        IF EXISTS
+            	        (
+            	            SELECT 1/0
+            	            FROM model.sys.objects
+            	        )
+            	        BEGIN
+                            SET @SkipModel = 0; /*We have read permissions in the model database, and can view the objects*/
+            	        END;
+            	    END TRY
+            	    BEGIN CATCH
+            	        SET @SkipModel = 1; /*We have read permissions in the model database ... oh wait we got tricked, we can't view the objects*/
+            	    END CATCH;
+            	END;
+            	ELSE
+            	BEGIN
+            	    SET @SkipModel = 1; /*We don't have read permissions in the model database*/
+            	END;
+			END;
+
+			IF ISNULL(@SkipMSDB_objs, 0) != 1 /*If @SkipMSDB_objs hasn't been set to 1 by the caller*/
+			BEGIN
+				IF EXISTS
+				(
+					SELECT	1/0
+            	    FROM	@db_perms
+            	    WHERE	database_name = N'msdb'
+				)
+				BEGIN
+					BEGIN TRY
+						IF EXISTS
+						(
+            	            SELECT	1/0
+            	            FROM	msdb.sys.objects
+						)
+						BEGIN
+							SET @SkipMSDB_objs = 0; /*We have read permissions in the msdb database, and can view the objects*/
+						END;
+					END TRY
+					BEGIN CATCH
+						SET @SkipMSDB_objs = 1; /*We have read permissions in the msdb database ... oh wait we got tricked, we can't view the objects*/
+					END CATCH;
+				END;
+				ELSE
+				BEGIN
+					SET @SkipMSDB_objs = 1; /*We don't have read permissions in the msdb database*/
+				END;
+			END;
+
+            IF ISNULL(@SkipMSDB_jobs, 0) != 1 /*If @SkipMSDB_jobs hasn't been set to 1 by the caller*/
+			BEGIN
+				IF EXISTS
+				(
+					SELECT	1/0
+            	    FROM	@db_perms
+            	    WHERE	database_name = N'msdb'
+				)
+				BEGIN
+					BEGIN TRY
+						IF EXISTS
+						(
+            	            SELECT	1/0
+            	            FROM	msdb.dbo.sysjobs
+						)
+						BEGIN
+							SET @SkipMSDB_jobs = 0; /*We have read permissions in the msdb database, and can view the objects*/
+						END;
+					END TRY
+					BEGIN CATCH
+						SET @SkipMSDB_jobs = 1; /*We have read permissions in the msdb database ... oh wait we got tricked, we can't view the objects*/
+					END CATCH;
+				END;
+				ELSE
+				BEGIN
+					SET @SkipMSDB_jobs = 1; /*We don't have read permissions in the msdb database*/
+				END;
+			END;
+		END;
 
 		SET @crlf = NCHAR(13) + NCHAR(10);
 		SET @ResultText = 'sp_Blitz Results: ' + @crlf;
@@ -331,15 +575,128 @@ AS
 		         OR LOWER(d.name) IN ('dbatools', 'dbadmin', 'dbmaintenance'))
 		OPTION(RECOMPILE);
 
-        IF(OBJECT_ID('tempdb..#InvalidLogins') IS NOT NULL)
-        BEGIN
-            EXEC sp_executesql N'DROP TABLE #InvalidLogins;';
-        END;
-								 
-		CREATE TABLE #InvalidLogins (
-			LoginSID    varbinary(85),
-			LoginName   VARCHAR(256)
+		/*Skip checks for database where we don't have read permissions*/
+		INSERT INTO
+		    #SkipChecks
+		(
+		    DatabaseName
+		)
+		SELECT
+		    DB_NAME(d.database_id)
+		FROM sys.databases AS d
+		WHERE NOT EXISTS
+		(
+		    SELECT
+			    1/0
+			FROM @db_perms AS dp
+			WHERE dp.database_name = DB_NAME(d.database_id)
 		);
+
+		/*Skip individial checks where we don't have permissions*/
+        INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+        SELECT
+            v.*
+        FROM (VALUES(NULL, 29, NULL)) AS v (DatabaseName, CheckID, ServerName) /*Looks for user tables in model*/
+        WHERE @SkipModel = 1;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+			v.*
+		FROM (VALUES(NULL,  28, NULL)) AS v (DatabaseName, CheckID, ServerName) /*Tables in the MSDB Database*/
+		WHERE @SkipMSDB_objs = 1;
+
+        INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+			v.*
+		FROM (VALUES
+					/*sysjobs checks*/
+					(NULL,   6, NULL), /*Jobs Owned By Users*/
+					(NULL,  57, NULL), /*SQL Agent Job Runs at Startup*/
+					(NULL,  79, NULL), /*Shrink Database Job*/
+					(NULL,  94, NULL), /*Agent Jobs Without Failure Emails*/
+					(NULL, 123, NULL), /*Agent Jobs Starting Simultaneously*/
+					(NULL, 180, NULL), /*Shrink Database Step In Maintenance Plan*/
+					(NULL, 181, NULL), /*Repetitive Maintenance Tasks*/
+					
+					/*sysalerts checks*/
+					(NULL,  30, NULL), /*Not All Alerts Configured*/
+					(NULL,  59, NULL), /*Alerts Configured without Follow Up*/
+                    (NULL,  61, NULL), /*No Alerts for Sev 19-25*/
+					(NULL,  96, NULL), /*No Alerts for Corruption*/
+					(NULL,  98, NULL), /*Alerts Disabled*/
+					(NULL, 219, NULL), /*Alerts Without Event Descriptions*/
+
+					/*sysoperators*/
+					(NULL,  31, NULL)  /*No Operators Configured/Enabled*/
+            ) AS v (DatabaseName, CheckID, ServerName)
+		WHERE @SkipMSDB_jobs = 1;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 68, NULL)) AS v (DatabaseName, CheckID, ServerName) /*DBCC command*/
+		WHERE @sa = 0;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 69, NULL)) AS v (DatabaseName, CheckID, ServerName) /*DBCC command*/
+		WHERE @sa = 0;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 92, NULL)) AS v (DatabaseName, CheckID, ServerName) /*xp_fixeddrives*/
+		WHERE @SkipXPFixedDrives = 1;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 106, NULL)) AS v (DatabaseName, CheckID, ServerName) /*alter trace*/
+		WHERE @SkipTrace = 1;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 211, NULL)) AS v (DatabaseName, CheckID, ServerName) /*xp_regread*/
+		WHERE @sa = 0;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 212, NULL)) AS v (DatabaseName, CheckID, ServerName) /*xp_regread*/
+		WHERE @SkipXPCMDShell = 1;
+
+		INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 2301, NULL))	AS v (DatabaseName, CheckID, ServerName) /*sp_validatelogins*/
+		WHERE @SkipValidateLogins = 1;
+
+        INSERT #SkipChecks (DatabaseName, CheckID, ServerName)
+		SELECT
+		    v.*
+		FROM (VALUES(NULL, 73, NULL)) AS v (DatabaseName, CheckID, ServerName) /*sp_validatelogins*/
+		WHERE @SkipGetAlertInfo = 1;
+
+		IF @sa = 0
+		BEGIN
+			INSERT INTO #BlitzResults
+			( CheckID ,
+			  Priority ,
+			  FindingsGroup ,
+			  Finding ,
+			  URL ,
+			  Details
+			)
+			SELECT 223 AS CheckID ,
+			         0 AS Priority ,
+			         'Informational' AS FindingsGroup ,
+			         'Some Checks Skipped' AS Finding ,
+			         '' AS URL ,
+			         'User ''' + @SUSER_NAME + ''' is not part of the sysadmin role, so we skipped some checks that are not possible due to lack of permissions.' AS Details;
+		END;
+		/*End of SkipsChecks added due to permissions*/
 
 		IF @SkipChecksTable IS NOT NULL
 			AND @SkipChecksSchema IS NOT NULL
@@ -372,7 +729,8 @@ AS
 				SELECT @IsWindowsOperatingSystem = 1 ;
 			END;
 
-		IF NOT EXISTS ( SELECT  1
+
+			IF NOT EXISTS ( SELECT  1
 							FROM    #SkipChecks
 							WHERE   DatabaseName IS NULL AND CheckID = 106 )
 							AND (select convert(int,value_in_use) from sys.configurations where name = 'default trace enabled' ) = 1
@@ -520,6 +878,12 @@ AS
 						INSERT INTO #SkipChecks (CheckID, DatabaseName) VALUES (80, 'model');  /* Max file size set */
 						INSERT INTO #SkipChecks (CheckID, DatabaseName) VALUES (80, 'msdb');  /* Max file size set */
 						INSERT INTO #SkipChecks (CheckID, DatabaseName) VALUES (80, 'tempdb');  /* Max file size set */
+						INSERT INTO #SkipChecks (CheckID) VALUES (224); /* CheckID 224 - Performance - SSRS/SSAS/SSIS Installed */
+						INSERT INTO #SkipChecks (CheckID) VALUES (92); /* CheckID 92 - drive space */
+						INSERT INTO #SkipChecks (CheckID) VALUES (258);/* CheckID 258 - Security - SQL Server service is running as LocalSystem or NT AUTHORITY\SYSTEM */
+						INSERT INTO #SkipChecks (CheckID) VALUES (259);/* CheckID 259 - Security - SQL Server Agent service is running as LocalSystem or NT AUTHORITY\SYSTEM */
+						INSERT INTO #SkipChecks (CheckID) VALUES (260); /* CheckID 260 - Security - SQL Server service account is member of Administrators */
+						INSERT INTO #SkipChecks (CheckID) VALUES (261); /*CheckID 261 - Security - SQL Server Agent service account is member of Administrators */
 			            INSERT  INTO #BlitzResults
 			            ( CheckID ,
 				            Priority ,
@@ -840,7 +1204,7 @@ AS
 		IF @BringThePain = 0 AND 50 <= (SELECT COUNT(*) FROM sys.databases) AND @CheckUserDatabaseObjects = 1
 			BEGIN
 			SET @CheckUserDatabaseObjects = 0;
-			PRINT 'Running sp_Blitz @CheckUserDatabaseObjects = 1 on a server with 50+ databases may cause temporary insanity for the server and/or user.';
+			PRINT 'Running sp_Blitz @CheckUserDatabaseObjects = 1 on a server with 50+ databases may cause temporary problems for the server and/or user.';
 			PRINT 'If you''re sure you want to do this, run again with the parameter @BringThePain = 1.';
 			INSERT  INTO #BlitzResults
 			( CheckID ,
@@ -895,17 +1259,17 @@ AS
 				least one of the relevant checks is not being skipped then we can extract the
 				dbinfo information.
 				*/
-				IF NOT EXISTS ( SELECT 1 
-							FROM #BlitzResults 
-							WHERE CheckID = 223 AND URL = 'https://aws.amazon.com/rds/sqlserver/')
-					AND (
-							NOT EXISTS ( SELECT  1
-								FROM    #SkipChecks
-								WHERE   DatabaseName IS NULL AND CheckID = 2 )
-							OR NOT EXISTS ( SELECT  1
-								FROM    #SkipChecks
-								WHERE   DatabaseName IS NULL AND CheckID = 68 )
-					)
+				IF NOT EXISTS
+				(
+					SELECT	1/0 
+					FROM	#BlitzResults 
+					WHERE	CheckID = 223 AND URL = 'https://aws.amazon.com/rds/sqlserver/'
+				) AND NOT EXISTS
+				(
+					SELECT  1/0
+					FROM    #SkipChecks
+					WHERE   DatabaseName IS NULL AND CheckID IN (2, 68)
+				)
 					BEGIN
 
 						IF @Debug IN (1, 2) RAISERROR('Extracting DBCC DBINFO data (used in checks 2 and 68).', 0, 1, 68) WITH NOWAIT;
@@ -1199,10 +1563,8 @@ AS
 				end of the stored proc, where we start doing things like checking
 				the plan cache, but those aren't as cleanly commented.
 
-				If you'd like to contribute your own check, use one of the check
-				formats shown above and email it to Help@BrentOzar.com. You don't
-				have to pick a CheckID or a link - we'll take care of that when we
-				test and publish the code. Thanks!
+				To contribute your own checks or fix bugs, learn more here:
+				https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/blob/main/CONTRIBUTING.md
 				*/
 
 				IF NOT EXISTS ( SELECT  1
@@ -1265,7 +1627,7 @@ AS
 								db_name(dek.database_id) AS DatabaseName,
 								''https://www.brentozar.com/go/tde'' AS URL,
 								''The certificate '' + c.name + '' is used to encrypt database '' + db_name(dek.database_id) + ''. Last backup date: '' + COALESCE(CAST(c.pvt_key_last_backup_date AS VARCHAR(100)), ''Never'') AS Details
-								FROM sys.certificates c INNER JOIN sys.dm_database_encryption_keys dek ON c.thumbprint = dek.encryptor_thumbprint
+								FROM master.sys.certificates c INNER JOIN sys.dm_database_encryption_keys dek ON c.thumbprint = dek.encryptor_thumbprint
 								WHERE pvt_key_last_backup_date IS NULL OR pvt_key_last_backup_date <= DATEADD(dd, -30, GETDATE())  OPTION (RECOMPILE);';
 							
 							IF @Debug = 2 AND @StringToExecute IS NOT NULL PRINT @StringToExecute;
@@ -1472,9 +1834,9 @@ AS
 						
 						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 2301) WITH NOWAIT;
 						
-                        INSERT INTO #InvalidLogins
-                        EXEC sp_validatelogins 
-                        ;
+                        /*
+						#InvalidLogins is filled at the start during the permissions check
+						*/
                         
 						INSERT  INTO #BlitzResults
 								( CheckID ,
@@ -3074,23 +3436,6 @@ AS
 
 						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 53) WITH NOWAIT;
 
-						--INSERT  INTO #BlitzResults
-                                         --            ( CheckID ,
-                                         --              Priority ,
-                                         --              FindingsGroup ,
-                                         --              Finding ,
-                                         --              URL ,
-                                         --              Details
-                                         --            )
-                                         --            SELECT TOP 1
-                                         --                         53 AS CheckID ,
-                                         --                         200 AS Priority ,
-                                         --                         'Informational' AS FindingsGroup ,
-                                         --                         'Cluster Node' AS Finding ,
-                                         --                         'https://BrentOzar.com/go/node' AS URL ,
-                                         --                         'This is a node in a cluster.' AS Details
-                                         --            FROM    sys.dm_os_cluster_nodes;
-
                                          DECLARE @AOFCI AS INT, @AOAG AS INT, @HAType AS VARCHAR(10), @errmsg AS VARCHAR(200)
 
                                          SELECT @AOAG = CAST(SERVERPROPERTY('IsHadrEnabled') AS INT)
@@ -3121,7 +3466,7 @@ AS
                                                                       Details
                                                                )
 
-                                                   SELECT 53 AS CheckID ,
+                                                   SELECT DISTINCT 53 AS CheckID ,
                                                    200 AS Priority ,
                                                    'Informational' AS FindingsGroup ,
                                                    'Cluster Node' AS Finding ,
@@ -3138,7 +3483,7 @@ AS
                                                                                    URL ,
                                                                                    Details
                                                                             )
-                                                                SELECT 53 AS CheckID ,
+                                                                SELECT DISTINCT 53 AS CheckID ,
                                                                 200 AS Priority ,
                                                                 'Informational' AS FindingsGroup ,
                                                                 'Cluster Node Info' AS Finding ,
@@ -3164,7 +3509,7 @@ AS
                                                                                    URL ,
                                                                                    Details
                                                                             )
-                                                                SELECT 53 AS CheckID ,
+                                                                SELECT DISTINCT 53 AS CheckID ,
                                                                 200 AS Priority ,
                                                                 'Informational' AS FindingsGroup ,
                                                                 'Cluster Node Info' AS Finding ,
@@ -3189,7 +3534,7 @@ AS
                                                                                    URL ,
                                                                                    Details
                                                                             )
-                                                                SELECT 53 AS CheckID ,
+                                                                SELECT DISTINCT 53 AS CheckID ,
                                                                 200 AS Priority ,
                                                                 'Informational' AS FindingsGroup ,
                                                                 'Cluster Node Info' AS Finding ,
@@ -3879,9 +4224,9 @@ AS
 
 							IF (@ProductVersionMajor = 15 AND @ProductVersionMinor < 2000) OR
 							   (@ProductVersionMajor = 14 AND @ProductVersionMinor < 1000) OR
-							   (@ProductVersionMajor = 13 AND @ProductVersionMinor < 5026) OR
+							   (@ProductVersionMajor = 13 AND @ProductVersionMinor < 6300) OR
 							   (@ProductVersionMajor = 12 AND @ProductVersionMinor < 6024) OR
-							   (@ProductVersionMajor = 11 AND @ProductVersionMinor < 7001) OR
+							   (@ProductVersionMajor = 11 /*AND @ProductVersionMinor < 7001)*/) OR
 							   (@ProductVersionMajor = 10.5 /*AND @ProductVersionMinor < 6000*/) OR
 							   (@ProductVersionMajor = 10 /*AND @ProductVersionMinor < 6000*/) OR
 							   (@ProductVersionMajor = 9 /*AND @ProductVersionMinor <= 5000*/)
@@ -3892,7 +4237,7 @@ AS
 								INSERT INTO #BlitzResults(CheckID, Priority, FindingsGroup, Finding, URL, Details)
 									VALUES(128, 20, 'Reliability', 'Unsupported Build of SQL Server', 'https://www.brentozar.com/go/unsupported',
 										'Version ' + CAST(@ProductVersionMajor AS VARCHAR(100)) + 
-										CASE WHEN @ProductVersionMajor >= 11 THEN
+										CASE WHEN @ProductVersionMajor >= 12 THEN
 										'.' + CAST(@ProductVersionMinor AS VARCHAR(100)) + ' is no longer supported by Microsoft. You need to apply a service pack.'
 										ELSE ' is no longer supported by Microsoft. You should be making plans to upgrade to a modern version of SQL Server.' END);
 								END;
@@ -4158,53 +4503,56 @@ AS
 
 						/* First, let's check that there aren't any issues with the trace files */
 						BEGIN TRY
-						
-						INSERT INTO #fnTraceGettable
-							(	TextData ,
-								DatabaseName ,
-								EventClass ,
-								Severity ,
-								StartTime ,
-								EndTime ,
-								Duration ,
-								NTUserName ,
-								NTDomainName ,
-								HostName ,
-								ApplicationName ,
-								LoginName ,
-								DBUserName
-							)
-							SELECT TOP 20000
-								CONVERT(NVARCHAR(4000),t.TextData) ,
-								t.DatabaseName ,
-								t.EventClass ,
-								t.Severity ,
-								t.StartTime ,
-								t.EndTime ,
-								t.Duration ,
-								t.NTUserName ,
-								t.NTDomainName ,
-								t.HostName ,
-								t.ApplicationName ,
-								t.LoginName ,
-								t.DBUserName
-							FROM sys.fn_trace_gettable(@base_tracefilename, DEFAULT) t
-							WHERE
-							(
-								t.EventClass = 22
-								AND t.Severity >= 17
-								AND t.StartTime > DATEADD(dd, -30, GETDATE())
-							)
-							OR
-							(
-							    t.EventClass IN (92, 93)
-                                AND t.StartTime > DATEADD(dd, -30, GETDATE())
-                                AND t.Duration > 15000000
-							)
-							OR
-							(
-								t.EventClass IN (94, 95, 116)
-							)
+
+						IF @SkipTrace = 0
+						BEGIN
+						    INSERT INTO #fnTraceGettable
+						    	(	TextData ,
+						    		DatabaseName ,
+						    		EventClass ,
+						    		Severity ,
+						    		StartTime ,
+						    		EndTime ,
+						    		Duration ,
+						    		NTUserName ,
+						    		NTDomainName ,
+						    		HostName ,
+						    		ApplicationName ,
+						    		LoginName ,
+						    		DBUserName
+						    	)
+						    	SELECT TOP 20000
+						    		CONVERT(NVARCHAR(4000),t.TextData) ,
+						    		t.DatabaseName ,
+						    		t.EventClass ,
+						    		t.Severity ,
+						    		t.StartTime ,
+						    		t.EndTime ,
+						    		t.Duration ,
+						    		t.NTUserName ,
+						    		t.NTDomainName ,
+						    		t.HostName ,
+						    		t.ApplicationName ,
+						    		t.LoginName ,
+						    		t.DBUserName
+						    	FROM sys.fn_trace_gettable(@base_tracefilename, DEFAULT) t
+						    	WHERE
+						    	(
+						    		t.EventClass = 22
+						    		AND t.Severity >= 17
+						    		AND t.StartTime > DATEADD(dd, -30, GETDATE())
+						    	)
+						    	OR
+						    	(
+						    	    t.EventClass IN (92, 93)
+                                    AND t.StartTime > DATEADD(dd, -30, GETDATE())
+                                    AND t.Duration > 15000000
+						    	)
+						    	OR
+						    	(
+						    		t.EventClass IN (94, 95, 116)
+						    	)
+							END;
 
 							SET @TraceFileIssue = 0
 
@@ -4497,6 +4845,10 @@ AS
 						  FROM sys.all_columns
 						  WHERE name = 'is_memory_optimized_elevate_to_snapshot_on' AND object_id = OBJECT_ID('sys.databases')
                             AND SERVERPROPERTY('EngineEdition') <> 8; /* Hekaton is always enabled in Managed Instances per https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/1919 */
+						INSERT INTO #DatabaseDefaults
+						  SELECT 'is_accelerated_database_recovery_on', 0, 145, 210, 'Acclerated Database Recovery Enabled', 'https://www.brentozar.com/go/dbdefaults', NULL
+						  FROM sys.all_columns
+						  WHERE name = 'is_accelerated_database_recovery_on' AND object_id = OBJECT_ID('sys.databases') AND SERVERPROPERTY('EngineEdition') NOT IN (5, 8) ;
 
 						DECLARE DatabaseDefaultsLoop CURSOR FOR
 						  SELECT name, DefaultValue, CheckID, Priority, Finding, URL, Details
@@ -4641,6 +4993,78 @@ IF @ProductVersionMajor >= 10
 						  AND [servicename] LIKE 'SQL Server Agent%'
 						  AND CAST(SERVERPROPERTY('Edition') AS VARCHAR(1000)) NOT LIKE '%xpress%';
 
+					END;
+				END;
+/* CheckID 258 - Security - SQL Server Service is running as LocalSystem or NT AUTHORITY\SYSTEM */
+IF @ProductVersionMajor >= 10 
+			   AND NOT EXISTS ( SELECT  1
+							    FROM    #SkipChecks
+							    WHERE   DatabaseName IS NULL AND CheckID = 258 )
+				BEGIN
+				IF EXISTS ( SELECT  1
+							FROM    sys.all_objects
+							WHERE   [name] = 'dm_server_services' )
+					BEGIN
+						  IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 258) WITH NOWAIT;
+						
+						  INSERT    INTO [#BlitzResults]
+									( [CheckID] ,
+									  [Priority] ,
+									  [FindingsGroup] ,
+									  [Finding] ,
+									  [URL] ,
+									  [Details] )
+
+							SELECT
+							258 AS [CheckID] ,
+							1 AS [Priority] ,
+							'Security' AS [FindingsGroup] ,
+							'Dangerous Service Account' AS [Finding] ,
+							'https://vladdba.com/SQLServerSvcAccount' AS [URL] ,
+							'SQL Server''s service account is '+ [service_account] 
+							+' - meaning that anyone who can use xp_cmdshell can do absolutely anything on the host.'  AS [Details]
+						  FROM
+							[sys].[dm_server_services]
+						  WHERE ([service_account] = 'LocalSystem'
+						    OR LOWER([service_account]) = 'nt authority\system')
+						  AND [servicename] LIKE 'SQL Server%'
+						  AND [servicename] NOT LIKE 'SQL Server Agent%';
+					END;
+				END;
+
+/* CheckID 259 - Security - SQL Server Agent Service is running as LocalSystem or NT AUTHORITY\SYSTEM */
+IF @ProductVersionMajor >= 10 
+			   AND NOT EXISTS ( SELECT  1
+							    FROM    #SkipChecks
+							    WHERE   DatabaseName IS NULL AND CheckID = 259 )
+				BEGIN
+				IF EXISTS ( SELECT  1
+							FROM    sys.all_objects
+							WHERE   [name] = 'dm_server_services' )
+					BEGIN
+						  IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 259) WITH NOWAIT;
+						
+						  INSERT    INTO [#BlitzResults]
+									( [CheckID] ,
+									  [Priority] ,
+									  [FindingsGroup] ,
+									  [Finding] ,
+									  [URL] ,
+									  [Details] )
+
+							SELECT
+							259 AS [CheckID] ,
+							1 AS [Priority] ,
+							'Security' AS [FindingsGroup] ,
+							'Dangerous Service Account' AS [Finding] ,
+							'https://vladdba.com/SQLServerSvcAccount' AS [URL] ,
+							'SQL Server Agent''s service account is '+ [service_account] 
+							+' - meaning that anyone who can create and run jobs can do absolutely anything on the host.'  AS [Details]
+						  FROM
+							[sys].[dm_server_services]
+						  WHERE ([service_account] = 'LocalSystem'
+						    OR LOWER([service_account]) = 'nt authority\system')
+						  AND [servicename] LIKE 'SQL Server Agent%';
 					END;
 				END;
 
@@ -6579,10 +7003,10 @@ IF @ProductVersionMajor >= 10
 																        DatabaseName
 													          FROM      #SkipChecks
 													          WHERE CheckID IS NULL OR CheckID = 19)
-										        AND is_published = 1
+										        AND (is_published = 1
 										        OR is_subscribed = 1
 										        OR is_merge_published = 1
-										        OR is_distributor = 1;
+										        OR is_distributor = 1);
 
 						        /* Method B: check subscribers for MSreplication_objects tables */
 						        EXEC dbo.sp_MSforeachdb 'USE [?]; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
@@ -6870,7 +7294,7 @@ IF @ProductVersionMajor >= 10
                                     Details = '[' + DBName + '].[' + SPSchema + '].[' + ProcName + '] has WITH RECOMPILE in the stored procedure code, which may cause increased CPU usage due to constant recompiles of the code.',
                                     CheckID = '78'
                                 FROM #Recompile AS TR 
-								WHERE ProcName NOT LIKE 'sp_AllNightLog%' AND ProcName NOT LIKE 'sp_AskBrent%' AND ProcName NOT LIKE 'sp_Blitz%'
+								WHERE ProcName NOT LIKE 'sp_AllNightLog%' AND ProcName NOT LIKE 'sp_AskBrent%' AND ProcName NOT LIKE 'sp_Blitz%' AND ProcName NOT LIKE 'sp_PressureDetector'
 								  AND DBName NOT IN ('master', 'model', 'msdb', 'tempdb');
                                 DROP TABLE #Recompile;
                             END;
@@ -7888,20 +8312,6 @@ IF @ProductVersionMajor >= 10
 
 						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 73) WITH NOWAIT;
 						
-						DECLARE @AlertInfo TABLE
-							(
-							  FailSafeOperator NVARCHAR(255) ,
-							  NotificationMethod INT ,
-							  ForwardingServer NVARCHAR(255) ,
-							  ForwardingSeverity INT ,
-							  PagerToTemplate NVARCHAR(255) ,
-							  PagerCCTemplate NVARCHAR(255) ,
-							  PagerSubjectTemplate NVARCHAR(255) ,
-							  PagerSendSubjectOnly NVARCHAR(255) ,
-							  ForwardAlways INT
-							);
-						INSERT  INTO @AlertInfo
-								EXEC [master].[dbo].[sp_MSgetalertinfo] @includeaddresses = 0;
 						INSERT  INTO #BlitzResults
 								( CheckID ,
 								  Priority ,
@@ -7916,7 +8326,7 @@ IF @ProductVersionMajor >= 10
 										'No Failsafe Operator Configured' AS Finding ,
 										'https://www.brentozar.com/go/failsafe' AS URL ,
 										( 'No failsafe operator is configured on this server.  This is a good idea just in-case there are issues with the [msdb] database that prevents alerting.' ) AS Details
-								FROM    @AlertInfo
+								FROM    #AlertInfo
 								WHERE   FailSafeOperator IS NULL;
 					END;
 
@@ -8381,112 +8791,147 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 										EXECUTE(@StringToExecute);
 									END;
 
-			/*
-			Starting with SQL Server 2014 SP2, Instant File Initialization
-			is logged in the SQL Server Error Log.
-			*/
-					IF NOT EXISTS ( SELECT  1
-									FROM    #SkipChecks
-									WHERE   DatabaseName IS NULL AND CheckID = 193 )
-							AND ((@ProductVersionMajor >= 13) OR (@ProductVersionMajor = 12 AND @ProductVersionMinor >= 5000))
+					/* Performance - Instant File Initialization Not Enabled  - Check 192 */
+					/* Server Info - Instant File Initialization Enabled      - Check 193 */
+					IF NOT EXISTS (	SELECT 1/0
+    								FROM   #SkipChecks
+    								WHERE  DatabaseName IS NULL AND CheckID = 192 /* IFI disabled check disabled */
+								  ) OR NOT EXISTS
+								  ( SELECT 1/0
+								  	FROM   #SkipChecks
+    								WHERE  DatabaseName IS NULL AND CheckID = 193 /* IFI enabled check disabled */
+								  )
+					BEGIN
+					    IF @Debug IN (1, 2) RAISERROR('Running  CheckId [%d] and CheckId [%d].', 0, 1, 192, 193) WITH NOWAIT;
+
+						DECLARE @IFISetting varchar(1) = N'N'
+        						,@IFIReadDMVFailed bit = 0
+        						,@IFIAllFailed bit = 0;
+
+						/* See if we can get the instant_file_initialization_enabled column from sys.dm_server_services */
+					    IF EXISTS
+						(
+						    SELECT 1/0
+						    FROM sys.all_columns
+						    WHERE [object_id] = OBJECT_ID(N'[sys].[dm_server_services]')
+						    AND [name] = N'instant_file_initialization_enabled'
+						)
 						BEGIN
+        					/* This needs to be a "dynamic" SQL statement because if the 'instant_file_initialization_enabled' column doesn't exist the procedure might fail on a bind error */
+							SET @StringToExecute = N'SELECT @IFISetting = instant_file_initialization_enabled' + @crlf +
+        					N'FROM sys.dm_server_services' + @crlf +
+        					N'WHERE filename LIKE ''%sqlservr.exe%''' + @crlf +
+        					N'OPTION (RECOMPILE);';
+            
+        					IF @Debug = 2 AND @StringToExecute IS NOT NULL PRINT @StringToExecute;
+        					IF @Debug = 2 AND @StringToExecute IS NULL PRINT '@StringToExecute has gone NULL, for some reason.';
+	
+       						EXEC dbo.sp_executesql
+       						    @StringToExecute
+       						    ,N'@IFISetting varchar(1) OUTPUT'
+       						    ,@IFISetting = @IFISetting OUTPUT
 							
-							IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 193) WITH NOWAIT;
-							
-							-- If this is Amazon RDS, use rdsadmin.dbo.rds_read_error_log
-							IF LEFT(CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS VARCHAR(8000)), 8) = 'EC2AMAZ-'
-							   AND LEFT(CAST(SERVERPROPERTY('MachineName') AS VARCHAR(8000)), 8) = 'EC2AMAZ-'
-							   AND db_id('rdsadmin') IS NOT NULL
-							   AND EXISTS(SELECT * FROM master.sys.all_objects WHERE name IN ('rds_startup_tasks', 'rds_help_revlogin', 'rds_hexadecimal', 'rds_failover_tracking', 'rds_database_tracking', 'rds_track_change'))
-								BEGIN
-								INSERT INTO #ErrorLog
-								EXEC rdsadmin.dbo.rds_read_error_log 0, 1, N'Database Instant File Initialization: enabled';
-								END
-							ELSE
-								BEGIN
-								INSERT INTO #ErrorLog
-								EXEC sys.xp_readerrorlog 0, 1, N'Database Instant File Initialization: enabled';
-								END
+							SET @IFIReadDMVFailed = 0;
+    					END
+    					ELSE 
+						/* We couldn't get the instant_file_initialization_enabled column from sys.dm_server_services, fall back to read error log */
+    					BEGIN
+       						SET @IFIReadDMVFailed = 1;
+       						/* If this is Amazon RDS, we'll use the rdsadmin.dbo.rds_read_error_log */
+       						IF LEFT(CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS VARCHAR(8000)), 8) = 'EC2AMAZ-'
+       						AND LEFT(CAST(SERVERPROPERTY('MachineName') AS VARCHAR(8000)), 8) = 'EC2AMAZ-'
+       						AND db_id('rdsadmin') IS NOT NULL
+       						AND EXISTS ( SELECT 1/0
+       					    			 FROM   master.sys.all_objects
+       					    			 WHERE  name IN ('rds_startup_tasks', 'rds_help_revlogin', 'rds_hexadecimal', 'rds_failover_tracking', 'rds_database_tracking', 'rds_track_change')
+       								   )
+       						BEGIN
+           						/* Amazon RDS detected, read rdsadmin.dbo.rds_read_error_log */
+           						INSERT INTO #ErrorLog
+           						EXEC rdsadmin.dbo.rds_read_error_log 0, 1, N'Database Instant File Initialization: enabled';
+       						END
+       						ELSE
+       						BEGIN
+           						/* Try to read the error log, this might fail due to permissions */
+           						BEGIN TRY
+               						INSERT INTO #ErrorLog
+               						EXEC sys.xp_readerrorlog 0, 1, N'Database Instant File Initialization: enabled';
+           						END TRY
+           						BEGIN CATCH
+               						IF @Debug IN (1, 2) RAISERROR('No permissions to execute xp_readerrorlog.', 0, 1) WITH NOWAIT;
+               						SET @IFIAllFailed = 1;
+           						END CATCH
+       						END;
+    					END;
 
-							IF @@ROWCOUNT > 0
-								begin
-								INSERT  INTO #BlitzResults
-										( CheckID ,
-										  [Priority] ,
-										  FindingsGroup ,
-										  Finding ,
-										  URL ,
-										  Details
-										)
-										SELECT
-												193 AS [CheckID] ,
-												250 AS [Priority] ,
-												'Server Info' AS [FindingsGroup] ,
-												'Instant File Initialization Enabled' AS [Finding] ,
-												'https://www.brentozar.com/go/instant' AS [URL] ,
-												'The service account has the Perform Volume Maintenance Tasks permission.';
-								end
-							else -- if version of sql server has instant_file_initialization_enabled column in dm_server_services, check that too
-							     --  in the event the error log has been cycled and the startup messages are not in the current error log
-								begin
-								if EXISTS ( SELECT  *
-												FROM    sys.all_objects o
-														INNER JOIN sys.all_columns c ON o.object_id = c.object_id
-												WHERE   o.name = 'dm_server_services'
-														AND c.name = 'instant_file_initialization_enabled' )
-									begin
-									SET @StringToExecute = N'
-									INSERT  INTO #BlitzResults
-											( CheckID ,
-											  [Priority] ,
-											  FindingsGroup ,
-											  Finding ,
-											  URL ,
-											  Details
-											)
-											SELECT
-													193 AS [CheckID] ,
-													250 AS [Priority] ,
-													''Server Info'' AS [FindingsGroup] ,
-													''Instant File Initialization Enabled'' AS [Finding] ,
-													''https://www.brentozar.com/go/instant'' AS [URL] ,
-													''The service account has the Perform Volume Maintenance Tasks permission.''
-											where exists (select 1 FROM sys.dm_server_services
-											               WHERE instant_file_initialization_enabled = ''Y''
-											               AND filename LIKE ''%sqlservr.exe%'')
-											OPTION (RECOMPILE);';
-									EXEC(@StringToExecute);
-									end;
-								end;
-						END;
+						IF @IFIAllFailed = 0
+    					BEGIN
+        					IF @IFIReadDMVFailed = 1
+        					/* We couldn't read the DMV so set the @IFISetting variable using the error log */
+        					BEGIN
+        					    IF EXISTS ( SELECT 1/0
+        					        		FROM   #ErrorLog
+        					        		WHERE  LEFT([Text], 45) = N'Database Instant File Initialization: enabled'
+        					    		  )
+        					    BEGIN
+        					        SET @IFISetting = 'Y';
+        					    END
+        					    ELSE
+        					    BEGIN
+        					        SET @IFISetting = 'N';
+        					    END;
+        					END;
 
-			/* Server Info - Instant File Initialization Not Enabled - Check 192 - SQL Server 2016 SP1 and newer */
-						IF NOT EXISTS ( SELECT  1
-										FROM    #SkipChecks
-										WHERE   DatabaseName IS NULL AND CheckID = 192 )
-							AND EXISTS ( SELECT  *
-											FROM    sys.all_objects o
-													INNER JOIN sys.all_columns c ON o.object_id = c.object_id
-											WHERE   o.name = 'dm_server_services'
-													AND c.name = 'instant_file_initialization_enabled' )
-							BEGIN
-										
-										IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 192) WITH NOWAIT;
-										
-										SET @StringToExecute = 'INSERT INTO #BlitzResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-			SELECT  192 AS CheckID ,
-			50 AS Priority ,
-			''Server Info'' AS FindingsGroup ,
-			''Instant File Initialization Not Enabled'' AS Finding ,
-			''https://www.brentozar.com/go/instant'' AS URL ,
-			''Consider enabling IFI for faster restores and data file growths.''
-			FROM sys.dm_server_services WHERE instant_file_initialization_enabled <> ''Y'' AND filename LIKE ''%sqlservr.exe%'' OPTION (RECOMPILE);';
-										
-										IF @Debug = 2 AND @StringToExecute IS NOT NULL PRINT @StringToExecute;
-										IF @Debug = 2 AND @StringToExecute IS NULL PRINT '@StringToExecute has gone NULL, for some reason.';
-										
-										EXECUTE(@StringToExecute);
-									END;
+					        IF NOT EXISTS ( SELECT 1/0
+            								FROM   #SkipChecks
+					    					WHERE  DatabaseName IS NULL AND CheckID = 192 /* IFI disabled check disabled */
+        								  ) AND @IFISetting = 'N'
+        					BEGIN
+        					    INSERT INTO #BlitzResults
+        					    (
+        					        CheckID ,
+        					        [Priority] ,
+        					        FindingsGroup ,
+        					        Finding ,
+        					        URL ,
+        					        Details
+        					    )
+        					    SELECT
+        					        192 AS [CheckID] ,
+							        50 AS [Priority] ,
+							        'Performance' AS [FindingsGroup] ,
+        					        'Instant File Initialization Not Enabled' AS [Finding] ,
+							        'https://www.brentozar.com/go/instant' AS [URL] ,
+        					        'Consider enabling IFI for faster restores and data file growths.' AS [Details]
+        					END;
+
+					        IF NOT EXISTS ( SELECT 1/0
+					            			FROM   #SkipChecks
+					            			WHERE  DatabaseName IS NULL AND CheckID = 193 /* IFI enabled check disabled */
+					        			  ) AND @IFISetting = 'Y'
+					        BEGIN
+					            INSERT INTO #BlitzResults
+					            (
+					                CheckID ,
+					                [Priority] ,
+					                FindingsGroup ,
+					                Finding ,
+					                URL ,
+					                Details
+					            )
+					            SELECT
+					                193 AS [CheckID] ,
+							        250 AS [Priority] ,
+							        'Server Info' AS [FindingsGroup] ,
+					                'Instant File Initialization Enabled' AS [Finding] ,
+							        'https://www.brentozar.com/go/instant' AS [URL] ,
+					                'The service account has the Perform Volume Maintenance Tasks permission.' AS [Details]
+					        END;
+					    END;
+					END;
+
+					/* End of checkId 192 */
+					/* End of checkId 193 */
 
 					IF NOT EXISTS ( SELECT  1
 									FROM    #SkipChecks
@@ -8864,31 +9309,39 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 										WHERE   DatabaseName IS NULL AND CheckID = 211 )
 								BEGIN																		
 								
+								/* Variables for check 211: */
+								DECLARE
+									@powerScheme varchar(36)
+									,@cpu_speed_mhz int
+									,@cpu_speed_ghz decimal(18,2)
+									,@ExecResult int;
+
 								IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 211) WITH NOWAIT;
+								IF @sa = 0 RAISERROR('The errors: ''xp_regread() returned error 5, ''Access is denied.'''' can be safely ignored', 0, 1) WITH NOWAIT;
 
-								DECLARE @outval VARCHAR(36);
-								/* Get power plan if set by group policy [Git Hub Issue #1620] */						
-								EXEC master.sys.xp_regread @rootkey = 'HKEY_LOCAL_MACHINE',
-														   @key = 'SOFTWARE\Policies\Microsoft\Power\PowerSettings',
-														   @value_name = 'ActivePowerScheme',
-														   @value = @outval OUTPUT,
-														   @no_output = 'no_output';
+									/* Get power plan if set by group policy [Git Hub Issue #1620] */						
+									EXEC xp_regread @rootkey	= N'HKEY_LOCAL_MACHINE',
+													@key		= N'SOFTWARE\Policies\Microsoft\Power\PowerSettings',
+													@value_name	= N'ActivePowerScheme',
+													@value		= @powerScheme OUTPUT,
+													@no_output	= N'no_output';
 
-								IF @outval IS NULL /* If power plan was not set by group policy, get local value [Git Hub Issue #1620]*/
-								EXEC master.sys.xp_regread @rootkey = 'HKEY_LOCAL_MACHINE',
-								                           @key = 'SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes',
-								                           @value_name = 'ActivePowerScheme',
-								                           @value = @outval OUTPUT;
-														   
-								DECLARE @cpu_speed_mhz int,
-								        @cpu_speed_ghz decimal(18,2);
+									IF @powerScheme IS NULL /* If power plan was not set by group policy, get local value [Git Hub Issue #1620]*/
+									EXEC xp_regread @rootkey	= N'HKEY_LOCAL_MACHINE',
+													@key		= N'SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes',
+													@value_name	= N'ActivePowerScheme',
+													@value		= @powerScheme OUTPUT;
 								
-								EXEC master.sys.xp_regread @rootkey = 'HKEY_LOCAL_MACHINE',
-								                           @key = 'HARDWARE\DESCRIPTION\System\CentralProcessor\0',
-								                           @value_name = '~MHz',
-								                           @value = @cpu_speed_mhz OUTPUT;
-								
-								SELECT @cpu_speed_ghz = CAST(CAST(@cpu_speed_mhz AS DECIMAL) / 1000 AS DECIMAL(18,2));
+									/* Get the cpu speed*/
+									EXEC @ExecResult = xp_regread @rootkey		= N'HKEY_LOCAL_MACHINE',
+					                							  @key			= N'HARDWARE\DESCRIPTION\System\CentralProcessor\0',
+					                							  @value_name	= N'~MHz',
+					                							  @value		= @cpu_speed_mhz OUTPUT;
+
+									/* Convert the Megahertz to Gigahertz */
+									IF @ExecResult != 0 RAISERROR('We couldn''t retrieve the CPU speed, you will see Unknown in the results', 0, 1)
+
+									SET @cpu_speed_ghz = CAST(CAST(@cpu_speed_mhz AS decimal) / 1000 AS decimal(18,2));
 
 									INSERT  INTO #BlitzResults
 										( CheckID ,
@@ -8904,9 +9357,9 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 									'Power Plan' AS Finding,
 									'https://www.brentozar.com/blitz/power-mode/' AS URL,
 									'Your server has '
-									+ CAST(@cpu_speed_ghz as VARCHAR(4))
+									+ ISNULL(CAST(@cpu_speed_ghz as VARCHAR(8)), 'Unknown ')
 									+ 'GHz CPUs, and is in '
-									+ CASE @outval
+									+ CASE @powerScheme
 							             WHEN 'a1841308-3541-4fab-bc81-f71556f20b4a'
 							             THEN 'power saving mode -- are you sure this is a production SQL Server?'
 							             WHEN '381b4222-f694-41f0-9685-ff5bb260df2e'
@@ -9178,6 +9631,130 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 
                             END;
 
+                        /* CheckID 260 - Security - SQL Server service account is member of Administrators */
+						IF NOT EXISTS ( SELECT  1
+										FROM    #SkipChecks
+										WHERE   DatabaseName IS NULL AND CheckID = 260 ) AND @ProductVersionMajor >= 10 
+							BEGIN
+                                
+								IF (SELECT value_in_use FROM  sys.configurations WHERE [name] = 'xp_cmdshell') = 1
+								AND EXISTS ( SELECT  1 FROM    sys.all_objects	WHERE   [name] = 'dm_server_services' )
+                                BEGIN
+								    IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 260) WITH NOWAIT;
+                                    IF OBJECT_ID('tempdb..#localadmins') IS NOT NULL DROP TABLE #localadmins;
+                                    CREATE TABLE #localadmins (cmdshell_output NVARCHAR(1000));
+                                    
+                                    INSERT INTO #localadmins
+                                    EXEC /**/xp_cmdshell/**/ N'net localgroup administrators' /* added comments around command since some firewalls block this string TL 20210221 */
+                                    
+                                    IF EXISTS (SELECT 1 
+                                                FROM #localadmins 
+                                                WHERE LOWER(cmdshell_output) = ( SELECT LOWER([service_account])
+												                                 FROM   [sys].[dm_server_services]
+												                                 WHERE  [servicename] LIKE 'SQL Server%'
+												                                   AND [servicename] NOT LIKE 'SQL Server Agent%'
+												                                   AND [servicename] NOT LIKE 'SQL Server Launchpad%'))
+                                    BEGIN
+								    INSERT  INTO #BlitzResults
+								    		( CheckID ,
+								    		  Priority ,
+								    		  FindingsGroup ,
+								    		  Finding ,
+								    		  URL ,
+								    		  Details
+								    		)
+								    		SELECT
+								    				 260 AS CheckID
+								    				,1 AS Priority
+								    				,'Security' AS FindingsGroup
+								    				,'Dangerous Service Account' AS Finding
+								    				,'https://vladdba.com/SQLServerSvcAccount' AS URL
+								    				,'SQL Server''s service account is a member of the local Administrators group - meaning that anyone who can use xp_cmdshell can do anything on the host.' as Details
+								    									    		
+								    END;
+								    
+                                 END;
+                            END;
+
+                        /* CheckID 261 - Security - SQL Server Agent service account is member of Administrators */
+						IF NOT EXISTS ( SELECT  1
+										FROM    #SkipChecks
+										WHERE   DatabaseName IS NULL AND CheckID = 261 ) AND @ProductVersionMajor >= 10 
+							BEGIN
+								
+								IF (SELECT value_in_use FROM  sys.configurations WHERE [name] = 'xp_cmdshell') = 1
+								AND EXISTS ( SELECT  1 FROM    sys.all_objects	WHERE   [name] = 'dm_server_services' )
+                                BEGIN
+                                    IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 261) WITH NOWAIT;
+									/*If this table exists and CheckId 260 was not skipped, then we're piggybacking off of 260's results */
+                                    IF OBJECT_ID('tempdb..#localadmins') IS NOT NULL 
+									   AND NOT EXISTS ( SELECT  1
+										                FROM    #SkipChecks
+										                WHERE   DatabaseName IS NULL AND CheckID = 260 )
+                                    BEGIN 
+									    IF @Debug IN (1, 2) RAISERROR('CheckId [%d] - found #localadmins table from CheckID 260 - no need to call xp_cmdshell again', 0, 1, 261) WITH NOWAIT;
+                                    
+                                        IF EXISTS (SELECT 1 
+                                                    FROM #localadmins 
+                                                    WHERE LOWER(cmdshell_output) = ( SELECT LOWER([service_account])
+												                                     FROM   [sys].[dm_server_services]
+												                                     WHERE  [servicename] LIKE 'SQL Server Agent%'
+												                                       AND [servicename] NOT LIKE 'SQL Server Launchpad%'))
+                                        BEGIN
+								        INSERT  INTO #BlitzResults
+								    		    ( CheckID ,
+								    		      Priority ,
+								    		      FindingsGroup ,
+								    		      Finding ,
+								    		      URL ,
+								    		      Details
+								    		    )
+								    		    SELECT
+								    		    		 261 AS CheckID
+								    		    		,1 AS Priority
+								    		    		,'Security' AS FindingsGroup
+									    				,'Dangerous Service Account' AS Finding
+									    				,'https://vladdba.com/SQLServerSvcAccount' AS URL
+								    		    		,'SQL Server Agent''s service account is a member of the local Administrators group - meaning that anyone who can create and run jobs can do anything on the host.' as Details
+								    									    		
+								        END;
+								    END; /*piggyback*/
+									ELSE /*can't piggyback*/
+									BEGIN
+									    /*had to use a different table name because SQL Server/SSMS complains when parsing that the table still exists when it gets to the create part*/
+									    IF OBJECT_ID('tempdb..#localadminsag') IS NOT NULL DROP TABLE #localadminsag;
+									    CREATE TABLE #localadminsag (cmdshell_output NVARCHAR(1000));
+										INSERT INTO #localadmins
+										EXEC /**/xp_cmdshell/**/ N'net localgroup administrators' /* added comments around command since some firewalls block this string TL 20210221 */
+                                    
+										IF EXISTS (SELECT 1 
+                                                FROM #localadmins 
+                                                WHERE LOWER(cmdshell_output) = ( SELECT LOWER([service_account])
+												                                 FROM   [sys].[dm_server_services]
+												                                 WHERE  [servicename] LIKE 'SQL Server Agent%'
+												                                   AND [servicename] NOT LIKE 'SQL Server Launchpad%'))
+										BEGIN
+								        INSERT  INTO #BlitzResults
+								    		    ( CheckID ,
+								    		      Priority ,
+								    		      FindingsGroup ,
+								    		      Finding ,
+								    		      URL ,
+								    		      Details
+								    		    )
+								    		    SELECT
+								    		    		 261 AS CheckID
+								    		    		,1 AS Priority
+								    		    		,'Security' AS FindingsGroup
+									    				,'Dangerous Service Account' AS Finding
+									    				,'https://vladdba.com/SQLServerSvcAccount' AS URL
+								    		    		,'SQL Server Agent''s service account is a member of the local Administrators group - meaning that anyone who can create and run jobs can do anything on the host.' as Details
+								    									    		
+								        END;
+
+									END;/*can't piggyback*/
+                                 END;
+                            END; /* CheckID 261 */
 
 					END; /* IF @CheckServerInfo = 1 */
 			END; /* IF ( ( SERVERPROPERTY('ServerName') NOT IN ( SELECT ServerName */
@@ -9560,20 +10137,22 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 												FROM #BlitzResults
 												WHERE Priority > 0 AND Priority < 255 AND FindingsGroup IS NOT NULL AND Finding IS NOT NULL
 												AND FindingsGroup <> 'Security' /* Specifically excluding security checks for public exports */)
-							SELECT
-								CASE
-									WHEN r.Priority <> COALESCE(rPrior.Priority, 0) OR r.FindingsGroup <> rPrior.FindingsGroup  THEN @crlf + N'**Priority ' + CAST(COALESCE(r.Priority,N'') AS NVARCHAR(5)) + N': ' + COALESCE(r.FindingsGroup,N'') + N'**:' + @crlf + @crlf
-									ELSE N''
-								END
-								+ CASE WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding <> COALESCE(rNext.Finding,N'') THEN N'- ' + COALESCE(r.Finding,N'') + N' ' + COALESCE(r.DatabaseName, N'') + N' - ' + COALESCE(r.Details,N'') + @crlf
-									   WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding AND r.Details = rNext.Details THEN N'- ' + COALESCE(r.Finding,N'') + N' - ' + COALESCE(r.Details,N'') + @crlf + @crlf + N'    * ' + COALESCE(r.DatabaseName, N'') + @crlf
-									   WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding THEN N'- ' + COALESCE(r.Finding,N'') + @crlf + CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN r.Details <> rPrior.Details THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE '' END
-									   ELSE CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN r.Details <> rPrior.Details THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE N'' + @crlf END
-								END + @crlf
-							  FROM Results r
-							  LEFT OUTER JOIN Results rPrior ON r.rownum = rPrior.rownum + 1
-							  LEFT OUTER JOIN Results rNext ON r.rownum = rNext.rownum - 1
-							ORDER BY r.rownum FOR XML PATH(N'');
+							SELECT 
+							    Markdown = CONVERT(XML, STUFF((SELECT
+																   CASE
+																	   WHEN r.Priority <> COALESCE(rPrior.Priority, 0) OR r.FindingsGroup <> rPrior.FindingsGroup  THEN @crlf + N'**Priority ' + CAST(COALESCE(r.Priority,N'') AS NVARCHAR(5)) + N': ' + COALESCE(r.FindingsGroup,N'') + N'**:' + @crlf + @crlf
+																	   ELSE N''
+																   END
+																   + CASE WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding <> COALESCE(rNext.Finding,N'') THEN N'- ' + COALESCE(r.Finding,N'') + N' ' + COALESCE(r.DatabaseName, N'') + N' - ' + COALESCE(r.Details,N'') + @crlf
+																	      WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding AND r.Details = rNext.Details THEN N'- ' + COALESCE(r.Finding,N'') + N' - ' + COALESCE(r.Details,N'') + @crlf + @crlf + N'    * ' + COALESCE(r.DatabaseName, N'') + @crlf
+																	      WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding THEN N'- ' + COALESCE(r.Finding,N'') + @crlf + @crlf + CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN r.Details <> rPrior.Details THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE '' END
+																	      ELSE CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN r.Details <> rPrior.Details THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE N'' + @crlf END
+																   END + @crlf
+															     FROM Results r
+															     LEFT OUTER JOIN Results rPrior ON r.rownum = rPrior.rownum + 1
+															     LEFT OUTER JOIN Results rNext ON r.rownum = rNext.rownum - 1
+															   ORDER BY r.rownum FOR XML PATH(N''), ROOT('Markdown'), TYPE).value('/Markdown[1]','VARCHAR(MAX)'), 1, 2, '')
+                                           + '<style>p { margin: 0 0 0.5em }</style>');
 						END;
                     ELSE IF @OutputType = 'XML'
                         BEGIN
@@ -9676,6 +10255,11 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 	IF(OBJECT_ID('tempdb..#InvalidLogins') IS NOT NULL)
 	BEGIN
 		EXEC sp_executesql N'DROP TABLE #InvalidLogins;';
+	END;
+
+	IF OBJECT_ID('tempdb..#AlertInfo') IS NOT NULL
+	BEGIN
+		EXEC sp_executesql N'DROP TABLE #AlertInfo;';
 	END;
 
 	/*

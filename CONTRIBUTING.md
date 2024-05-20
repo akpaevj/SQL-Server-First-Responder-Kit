@@ -22,7 +22,7 @@ If you can't find a similar issue, go ahead and open your own. Include as much d
 
 Open source is community-built software. Anyone is welcome to build things that would help make their job easier.
 
-Open source isn't free development, though. Working on these scripts is hard work: they have to work on case-sensitive instances, and on all supported versions of SQL Server (currently 2008 through 2017.) If you just waltz in and say, "Someone please bake me a cake," you're probably not going to get a cake.
+Open source isn't free development, though. Working on these scripts is hard work: they have to work on case-sensitive instances, and on all versions of SQL Server that Microsoft currently supports. If you just waltz in and say, "Someone please bake me a cake," you're probably not going to get a cake.
 
 If you want something, you're going to either need to build it yourself, or convince someone else to devote their free time to your feature request. You can do that by sponsoring development (offering to hire a developer to build it for you), or getting people excited enough that they volunteer to build it for you.
 
@@ -42,6 +42,8 @@ Note that if you're not ready to get started coding in the next week, or if you 
 
 We're not picky at all about style, but a few things to know:
 
+Don't touch the files that start with Install, like Install-All-Scripts.sql. Those are dynamically generated. You only have to touch the ones that start with sp_.
+
 Your code needs to compile & run on all currently supported versions of SQL Server. It's okay if functionality degrades, like if not all features are available, but at minimum the code has to compile and run.
 
 Your code must handle:
@@ -56,7 +58,7 @@ We know that's a pain, but that's the kind of thing we find out in the wild. Of 
 
 Rather than give you step-by-step instructions here, we'd rather link you to the work of others:
 
-* [How to fork a GitHub repository and contribute to an open source project](https://sqldbawithabeard.com/2019/11/29/how-to-fork-a-github-repository-and-contribute-to-an-open-source-project/)
+* [How to fork a GitHub repository and contribute to an open source project](https://blog.robsewell.com/blog/how-to-fork-a-github-repository-and-contribute-to-an-open-source-project/)
 
 
 

@@ -1,3 +1,13 @@
+IF OBJECT_ID('dbo.CommandExecute') IS NULL
+BEGIN
+	PRINT 'sp_DatabaseRestore is about to install, but you have not yet installed the Ola Hallengren maintenance scripts.'
+	PRINT 'sp_DatabaseRestore will still install, but to use that stored proc, you will need to install this:'
+	PRINT 'https://ola.hallengren.com'
+	PRINT 'You will see a bunch of warnings below because the Ola scripts are not installed yet, and that is okay:'
+END
+GO
+
+
 IF OBJECT_ID('dbo.sp_DatabaseRestore') IS NULL
 	EXEC ('CREATE PROCEDURE dbo.sp_DatabaseRestore AS RETURN 0;');
 GO
@@ -11,10 +21,10 @@ ALTER PROCEDURE [dbo].[sp_DatabaseRestore]
     @MoveDataDrive NVARCHAR(260) = NULL, 
     @MoveLogDrive NVARCHAR(260) = NULL, 
     @MoveFilestreamDrive NVARCHAR(260) = NULL,
-	@MoveFullTextCatalogDrive NVARCHAR(260) = NULL, 
-	@BufferCount INT = NULL,
-	@MaxTransferSize INT = NULL,
-	@BlockSize INT = NULL,
+    @MoveFullTextCatalogDrive NVARCHAR(260) = NULL, 
+    @BufferCount INT = NULL,
+    @MaxTransferSize INT = NULL,
+    @BlockSize INT = NULL,
     @TestRestore BIT = 0, 
     @RunCheckDB BIT = 0, 
     @RestoreDiff BIT = 0,
@@ -27,22 +37,27 @@ ALTER PROCEDURE [dbo].[sp_DatabaseRestore]
     @StopAt NVARCHAR(14) = NULL,
     @OnlyLogsAfter NVARCHAR(14) = NULL,
     @SimpleFolderEnumeration BIT = 0,
-	@SkipBackupsAlreadyInMsdb BIT = 0,
-	@DatabaseOwner sysname = NULL,
-	@SetTrustworthyON BIT = 0,
+    @SkipBackupsAlreadyInMsdb BIT = 0,
+    @DatabaseOwner sysname = NULL,
+    @SetTrustworthyON BIT = 0,
+    @FixOrphanUsers BIT = 0,
+    @KeepCdc BIT = 0,
     @Execute CHAR(1) = Y,
+    @FileExtensionDiff NVARCHAR(128) = NULL,
     @Debug INT = 0, 
     @Help BIT = 0,
     @Version     VARCHAR(30) = NULL OUTPUT,
-	@VersionDate DATETIME = NULL OUTPUT,
-    @VersionCheckMode BIT = 0
+    @VersionDate DATETIME = NULL OUTPUT,
+    @VersionCheckMode BIT = 0,
+    @FileNamePrefix NVARCHAR(260) = NULL,
+	@RunStoredProcAfterRestore NVARCHAR(260) = NULL
 AS
 SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 
 /*Versioning details*/
 
-SELECT @Version = '8.13', @VersionDate = '20230215';
+SELECT @Version = '8.19', @VersionDate = '20240222';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -157,6 +172,16 @@ BEGIN
 		@ContinueLogs = 1, 
 		@RunRecovery = 0,
 		@Debug = 0;
+
+	--Restore just through the latest DIFF, ignoring logs, and using a custom ".dif" file extension
+	EXEC dbo.sp_DatabaseRestore 
+		@Database = ''LogShipMe'', 
+		@BackupPathFull = ''D:\Backup\SQL2016PROD1A\LogShipMe\FULL\'', 
+		@BackupPathDiff = ''D:\Backup\SQL2016PROD1A\LogShipMe\DIFF\'',
+		@RestoreDiff = 1,
+		@FileExtensionDiff = ''dif'',
+		@ContinueLogs = 0, 
+		@RunRecovery = 1;
 
 	-- Restore from stripped backup set when multiple paths are used. This example will restore stripped full backup set along with stripped transactional logs set from multiple backup paths
 	EXEC dbo.sp_DatabaseRestore 
@@ -353,8 +378,8 @@ CREATE TABLE #Headers
     EncryptorThumbprint VARBINARY(20),
     EncryptorType NVARCHAR(32),
 	LastValidRestoreTime DATETIME, 
-	TimeZone NVARCHAR(256), 
-	CompressionAlgorithm NVARCHAR(256),
+	TimeZone NVARCHAR(32), 
+	CompressionAlgorithm NVARCHAR(32),
     --
     -- Seq added to retain order by
     --
@@ -498,6 +523,13 @@ BEGIN
 	BEGIN
 		RAISERROR('Supported values for @BlockSize are 512, 1024, 2048, 4096, 8192, 16384, 32768, and 65536', 0, 1) WITH NOWAIT;
 	END
+END
+
+--File Extension cleanup
+IF @FileExtensionDiff LIKE '%.%'
+BEGIN
+	IF @Execute = 'Y' OR @Debug = 1 RAISERROR('Removing "." from @FileExtensionDiff', 0, 1) WITH NOWAIT;
+	SET @FileExtensionDiff = REPLACE(@FileExtensionDiff,'.','');
 END
 
 SET @RestoreDatabaseID = DB_ID(@RestoreDatabaseName);
@@ -771,7 +803,7 @@ BEGIN
 				    WHEN Type = 'L' THEN @MoveLogDrive
 				    WHEN Type = 'S' THEN @MoveFilestreamDrive
 					WHEN Type = 'F' THEN @MoveFullTextCatalogDrive
-			    END + CASE 
+			    END + COALESCE(@FileNamePrefix, '') + CASE
                         WHEN @Database = @RestoreDatabaseName THEN REVERSE(LEFT(REVERSE(PhysicalName), CHARINDEX('\', REVERSE(PhysicalName), 1) -1))
 					    ELSE REPLACE(REVERSE(LEFT(REVERSE(PhysicalName), CHARINDEX('\', REVERSE(PhysicalName), 1) -1)), @Database, SUBSTRING(@RestoreDatabaseName, 2, LEN(@RestoreDatabaseName) -2))
 					    END AS TargetPhysicalName,
@@ -881,7 +913,7 @@ BEGIN
 	    /* now take split backups into account */
 	    IF (SELECT COUNT(*) FROM #SplitFullBackups) > 0
         BEGIN
-            RAISERROR('Split backups found', 0, 1) WITH NOWAIT;
+            IF @Debug = 1 RAISERROR('Split backups found', 0, 1) WITH NOWAIT;
 
 			SET @sql = N'RESTORE DATABASE ' + @RestoreDatabaseName + N' FROM '
                        + STUFF(
@@ -1044,9 +1076,15 @@ BEGIN
 	END
     /*End folder sanity check*/
     -- Find latest diff backup 
+	IF @FileExtensionDiff IS NULL
+	BEGIN
+		IF @Execute = 'Y' OR @Debug = 1 RAISERROR('No @FileExtensionDiff given, assuming "bak".', 0, 1) WITH NOWAIT;
+		SET @FileExtensionDiff = 'bak';
+	END
+
 	SELECT TOP 1 @LastDiffBackup = BackupFile, @CurrentBackupPathDiff = BackupPath
     FROM @FileList
-    WHERE BackupFile LIKE N'%.bak'
+    WHERE BackupFile LIKE N'%.' + @FileExtensionDiff
         AND
         BackupFile LIKE N'%' + @Database + '%'
 	    AND
@@ -1068,7 +1106,7 @@ BEGIN
 
 	    IF (SELECT COUNT(*) FROM #SplitDiffBackups) > 0
 		BEGIN
-			RAISERROR ('Split backups found', 0, 1) WITH NOWAIT;
+			IF @Debug = 1 RAISERROR ('Split backups found', 0, 1) WITH NOWAIT;
 			SET @sql = N'RESTORE DATABASE ' + @RestoreDatabaseName + N' FROM '
 									   + STUFF(
 											 (SELECT CHAR( 10 ) + ',DISK=''' + BackupPath + BackupFile + ''''
@@ -1316,7 +1354,7 @@ IF (@LogRecoveryOption = N'')
 IF (@StopAt IS NOT NULL)
 BEGIN
 	
-	IF @Execute = 'Y' OR @Debug = 1 RAISERROR('@OnlyLogsAfter is NOT NULL, deleting from @FileList', 0, 1) WITH NOWAIT;
+	IF @Execute = 'Y' OR @Debug = 1 RAISERROR('@StopAt is NOT NULL, deleting from @FileList', 0, 1) WITH NOWAIT;
 
 	IF LEN(@StopAt) <> 14 OR PATINDEX('%[^0-9]%', @StopAt) > 0
 	BEGIN
@@ -1350,7 +1388,7 @@ BEGIN
 		AND REPLACE( RIGHT( REPLACE( fl.BackupFile, RIGHT( fl.BackupFile, PATINDEX( '%_[0-9][0-9]%', REVERSE( fl.BackupFile ) ) ), '' ), 16 ), '_', '' ) > @StopAt
 		ORDER BY BackupFile;
 	END
-	
+
 	IF @ExtraLogFile IS NULL
 	BEGIN
 		DELETE fl
@@ -1361,6 +1399,10 @@ BEGIN
 	END
 	ELSE
 	BEGIN
+		-- If this is a split backup, @ExtraLogFile contains only the first split backup file, either _1.trn or _01.trn
+		-- Change @ExtraLogFile to the max split backup file, then delete all log files greater than this
+		SET @ExtraLogFile = REPLACE(REPLACE(@ExtraLogFile, '_1.trn', '_9.trn'), '_01.trn', '_64.trn')
+		
 		DELETE fl
 		FROM @FileList AS fl
 		WHERE BackupFile LIKE N'%.trn'
@@ -1423,7 +1465,7 @@ WHERE BackupFile IS NOT NULL;
 
 				IF (SELECT COUNT( * ) FROM #SplitLogBackups WHERE DenseRank = @LogRestoreRanking) > 1
 				BEGIN
-					RAISERROR ('Split backups found', 0, 1) WITH NOWAIT;
+					IF @Debug = 1 RAISERROR ('Split backups found', 0, 1) WITH NOWAIT;
 					SET @sql = N'RESTORE LOG ' + @RestoreDatabaseName + N' FROM '
 							   + STUFF(
 									(SELECT CHAR( 10 ) + ',DISK=''' + BackupPath + BackupFile + ''''
@@ -1461,13 +1503,18 @@ END
 -- Put database in a useable state 
 IF @RunRecovery = 1
 	BEGIN
-		SET @sql = N'RESTORE DATABASE ' + @RestoreDatabaseName + N' WITH RECOVERY' + NCHAR(13);
+		SET @sql = N'RESTORE DATABASE ' + @RestoreDatabaseName + N' WITH RECOVERY';
+		
+		IF @KeepCdc = 1
+			SET @sql = @sql + N', KEEP_CDC';
 
-			IF @Debug = 1 OR @Execute = 'N'
-			BEGIN
-				IF @sql IS NULL PRINT '@sql is NULL for RESTORE DATABASE: @RestoreDatabaseName';
-				PRINT @sql;
-			END; 
+		SET @sql = @sql + NCHAR(13);
+
+		IF @Debug = 1 OR @Execute = 'N'
+		BEGIN
+			IF @sql IS NULL PRINT '@sql is NULL for RESTORE DATABASE: @RestoreDatabaseName';
+			PRINT @sql;
+		END; 
 
 		IF @Debug IN (0, 1) AND @Execute = 'Y'
 			EXECUTE @sql = [dbo].[CommandExecute] @DatabaseContext=N'master', @Command = @sql, @CommandType = 'RECOVER DATABASE', @Mode = 1, @DatabaseName = @UnquotedRestoreDatabaseName, @LogToTable = 'Y', @Execute = 'Y';
@@ -1560,7 +1607,67 @@ IF @DatabaseOwner IS NOT NULL
 			END
 		END;
 
- -- If test restore then blow the database away (be careful)
+-- Link a user entry in the sys.database_principals system catalog view in the restored database to a SQL Server login of the same name
+IF @FixOrphanUsers = 1 
+	BEGIN
+		SET @sql = N'
+-- Fixup Orphan Users by setting database user sid to match login sid
+DECLARE @FixOrphansSql NVARCHAR(MAX);
+DECLARE @OrphanUsers TABLE (SqlToExecute NVARCHAR(MAX));
+USE ' + @RestoreDatabaseName + ';
+
+INSERT @OrphanUsers
+SELECT ''ALTER USER ['' + d.name + ''] WITH LOGIN = ['' + d.name + '']; ''
+	FROM  sys.database_principals d
+	INNER JOIN master.sys.server_principals s ON d.name COLLATE DATABASE_DEFAULT = s.name COLLATE DATABASE_DEFAULT
+	WHERE d.type_desc = ''SQL_USER''
+		AND d.name NOT IN (''guest'',''dbo'')
+		AND d.sid <> s.sid
+	ORDER BY d.name;
+
+SELECT @FixOrphansSql = (SELECT SqlToExecute AS [text()] FROM @OrphanUsers FOR XML PATH (''''), TYPE).value(''text()[1]'',''NVARCHAR(MAX)'');
+
+IF @FixOrphansSql IS NULL 
+	PRINT ''No orphan users require a sid fixup.'';
+ELSE
+BEGIN
+	PRINT ''Fix Orphan Users: '' + @FixOrphansSql;
+	EXECUTE(@FixOrphansSql);
+END;'
+
+		IF @Debug = 1 OR @Execute = 'N'
+		BEGIN
+			IF @sql IS NULL PRINT '@sql is NULL for Fix Orphan Users';
+			PRINT @sql;
+		END;
+
+		IF @Debug IN (0, 1) AND @Execute = 'Y'
+			EXECUTE [dbo].[CommandExecute] @DatabaseContext = 'master', @Command = @sql, @CommandType = 'UPDATE', @Mode = 1, @DatabaseName = @UnquotedRestoreDatabaseName, @LogToTable = 'Y', @Execute = 'Y';
+	END; 
+
+IF @RunStoredProcAfterRestore IS NOT NULL AND LEN(LTRIM(@RunStoredProcAfterRestore)) > 0
+BEGIN
+	PRINT 'Attempting to run ' + @RunStoredProcAfterRestore
+	SET @sql = N'EXEC ' + @RestoreDatabaseName + '.' + @RunStoredProcAfterRestore
+
+	IF @Debug = 1 OR @Execute = 'N'
+	BEGIN
+		IF @sql IS NULL PRINT '@sql is NULL when building for @RunStoredProcAfterRestore'
+		PRINT @sql
+	END
+			
+	IF @RunRecovery = 0
+	BEGIN
+		PRINT 'Unable to run Run Stored Procedure After Restore as database is not recovered. Run command again with @RunRecovery = 1'
+	END
+	ELSE
+    BEGIN
+		IF @Debug IN (0, 1) AND @Execute = 'Y'
+			EXEC sp_executesql  @sql
+	END
+END
+
+-- If test restore then blow the database away (be careful)
 IF @TestRestore = 1
 	BEGIN
 		SET @sql = N'DROP DATABASE ' + @RestoreDatabaseName + NCHAR(13);

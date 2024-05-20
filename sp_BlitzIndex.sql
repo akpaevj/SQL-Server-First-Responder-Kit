@@ -48,7 +48,7 @@ SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-SELECT @Version = '8.13', @VersionDate = '20230215';
+SELECT @Version = '8.19', @VersionDate = '20240222';
 SET @OutputType  = UPPER(@OutputType);
 
 IF(@VersionCheckMode = 1)
@@ -77,7 +77,7 @@ Known limitations of this version:
            filegroup/partition scheme etc.)
  --        (The compression and filegroup index create syntax is not trivial because it is set at the partition 
            level and is not trivial to code.)
- - Does not advise you about data modeling for clustered indexes and primary keys (primarily looks for signs of insanity.)
+ - Does not advise you about data modeling for clustered indexes and primary keys (primarily looks for signs of problems.)
 
 Unknown limitations of this version:
  - We knew them once, but we forgot.
@@ -253,9 +253,14 @@ IF OBJECT_ID('tempdb..#CheckConstraints') IS NOT NULL
 
 IF OBJECT_ID('tempdb..#FilteredIndexes') IS NOT NULL
 	DROP TABLE #FilteredIndexes;
-		
+
 IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL 
     DROP TABLE #Ignore_Databases
+		
+IF OBJECT_ID('tempdb..#dm_db_partition_stats_etc') IS NOT NULL 
+    DROP TABLE #dm_db_partition_stats_etc
+IF OBJECT_ID('tempdb..#dm_db_index_operational_stats') IS NOT NULL 
+    DROP TABLE #dm_db_index_operational_stats
 
         RAISERROR (N'Create temp tables.',0,1) WITH NOWAIT;
         CREATE TABLE #BlitzIndexResults
@@ -919,7 +924,7 @@ BEGIN TRY
             VALUES  ( 1, 
 			          0, 
 		              N'You''re trying to run sp_BlitzIndex on a server with ' + CAST(@NumDatabases AS NVARCHAR(8)) + N' databases. ',
-                      N'Running sp_BlitzIndex on a server with 50+ databases may cause temporary insanity for the server and/or user.',
+                      N'Running sp_BlitzIndex on a server with 50+ databases may cause temporary problems for the server and/or user.',
 				      N'If you''re sure you want to do this, run again with the parameter @BringThePain = 1.',
                       'http://FirstResponderKit.org', 
 					  '', 
@@ -946,7 +951,7 @@ BEGIN TRY
 					   bir.create_tsql,
 					   bir.more_info 
 					   FROM #BlitzIndexResults AS bir;
-				RAISERROR('Running sp_BlitzIndex on a server with 50+ databases may cause temporary insanity for the server', 12, 1);
+				RAISERROR('Running sp_BlitzIndex on a server with 50+ databases may cause temporary problems for the server', 12, 1);
 			END;
 
 		RETURN;
@@ -1065,6 +1070,8 @@ FROM     sys.databases
 ----------------------------------------
 BEGIN TRY
     BEGIN
+        DECLARE @d VARCHAR(19) = CONVERT(VARCHAR(19), GETDATE(), 121);
+        RAISERROR (N'starting at %s',0,1, @d) WITH NOWAIT;
 
         --Validate SQL Server Version
 
@@ -1214,16 +1221,16 @@ BEGIN TRY
         RAISERROR (N'Inserting data into #IndexColumns for clustered indexes and heaps',0,1) WITH NOWAIT;
         IF @Debug = 1
             BEGIN
-                PRINT SUBSTRING(@dsql, 0, 4000);
-                PRINT SUBSTRING(@dsql, 4000, 8000);
-                PRINT SUBSTRING(@dsql, 8000, 12000);
-                PRINT SUBSTRING(@dsql, 12000, 16000);
-                PRINT SUBSTRING(@dsql, 16000, 20000);
-                PRINT SUBSTRING(@dsql, 20000, 24000);
-                PRINT SUBSTRING(@dsql, 24000, 28000);
-                PRINT SUBSTRING(@dsql, 28000, 32000);
-                PRINT SUBSTRING(@dsql, 32000, 36000);
-                PRINT SUBSTRING(@dsql, 36000, 40000);
+                PRINT SUBSTRING(@dsql,     1, 4000);
+                PRINT SUBSTRING(@dsql,  4001, 4000);
+                PRINT SUBSTRING(@dsql,  8001, 4000);
+                PRINT SUBSTRING(@dsql, 12001, 4000);
+                PRINT SUBSTRING(@dsql, 16001, 4000);
+                PRINT SUBSTRING(@dsql, 20001, 4000);
+                PRINT SUBSTRING(@dsql, 24001, 4000);
+                PRINT SUBSTRING(@dsql, 28001, 4000);
+                PRINT SUBSTRING(@dsql, 32001, 4000);
+                PRINT SUBSTRING(@dsql, 36001, 4000);
             END;
 		BEGIN TRY
 			INSERT    #IndexColumns ( database_id, [schema_name], [object_id], index_id, key_ordinal, is_included_column, is_descending_key, partition_ordinal,
@@ -1435,47 +1442,82 @@ BEGIN TRY
 
             --NOTE: If you want to use the newer syntax for 2012+, you'll have to change 2147483647 to 11 on line ~819
 			--This change was made because on a table with lots of paritions, the OUTER APPLY was crazy slow.
-            SET @dsql = N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+			-- get relevant columns from sys.dm_db_partition_stats, sys.partitions and sys.objects 
+			IF OBJECT_ID('tempdb..#dm_db_partition_stats_etc') IS NOT NULL
+				DROP TABLE #dm_db_partition_stats_etc;
+
+			create table #dm_db_partition_stats_etc
+			(
+				database_id smallint not null
+				, object_id int not null
+				, sname sysname NULL
+				, index_id int
+				, partition_number int
+				, partition_id bigint
+				, row_count bigint
+				, reserved_MB bigint
+				, reserved_LOB_MB bigint
+				, reserved_row_overflow_MB bigint
+				, lock_escalation_desc nvarchar(60)
+				, data_compression_desc nvarchar(60)
+			)
+
+			-- get relevant info from sys.dm_db_index_operational_stats
+			IF OBJECT_ID('tempdb..#dm_db_index_operational_stats') IS NOT NULL
+				DROP TABLE #dm_db_index_operational_stats;
+			create table #dm_db_index_operational_stats
+			(
+				database_id smallint not null
+				, object_id int not null
+				, index_id int
+				, partition_number int
+				, hobt_id bigint
+				, leaf_insert_count bigint
+				, leaf_delete_count bigint
+				, leaf_update_count bigint
+				, range_scan_count bigint
+				, singleton_lookup_count bigint
+				, forwarded_fetch_count bigint
+				, lob_fetch_in_pages bigint
+				, lob_fetch_in_bytes bigint
+				, row_overflow_fetch_in_pages bigint
+				, row_overflow_fetch_in_bytes bigint
+				, row_lock_count bigint
+				, row_lock_wait_count bigint
+				, row_lock_wait_in_ms bigint
+				, page_lock_count bigint
+				, page_lock_wait_count bigint
+				, page_lock_wait_in_ms bigint
+				, index_lock_promotion_attempt_count bigint
+				, index_lock_promotion_count bigint
+				, page_latch_wait_count bigint
+				, page_latch_wait_in_ms bigint
+				, page_io_latch_wait_count bigint
+				, page_io_latch_wait_in_ms bigint
+				)
+  
+            SET @dsql = N'
+                        DECLARE @d VARCHAR(19) = CONVERT(VARCHAR(19), GETDATE(), 121)
+                        RAISERROR (N''start getting data into #dm_db_partition_stats_etc at %s'',0,1, @d) WITH NOWAIT;
+                        SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+                        INSERT INTO #dm_db_partition_stats_etc
+                        (
+                            database_id, object_id, sname, index_id, partition_number, partition_id, row_count, reserved_MB, reserved_LOB_MB, reserved_row_overflow_MB, lock_escalation_desc, data_compression_desc
+                        )
                         SELECT  ' + CAST(@DatabaseID AS NVARCHAR(10)) + N' AS database_id,
                                 ps.object_id, 
-								s.name,
+								s.name as sname,
                                 ps.index_id, 
                                 ps.partition_number, 
+                                ps.partition_id,
                                 ps.row_count,
                                 ps.reserved_page_count * 8. / 1024. AS reserved_MB,
                                 ps.lob_reserved_page_count * 8. / 1024. AS reserved_LOB_MB,
                                 ps.row_overflow_reserved_page_count * 8. / 1024. AS reserved_row_overflow_MB,
 								le.lock_escalation_desc,
-                            ' + CASE WHEN @SQLServerProductVersion NOT LIKE '9%' THEN N'par.data_compression_desc ' ELSE N'null as data_compression_desc ' END + N',
-                                SUM(os.leaf_insert_count), 
-                                SUM(os.leaf_delete_count), 
-                                SUM(os.leaf_update_count), 
-                                SUM(os.range_scan_count), 
-                                SUM(os.singleton_lookup_count),  
-                                SUM(os.forwarded_fetch_count),
-                                SUM(os.lob_fetch_in_pages), 
-                                SUM(os.lob_fetch_in_bytes), 
-                                SUM(os.row_overflow_fetch_in_pages),
-                                SUM(os.row_overflow_fetch_in_bytes), 
-                                SUM(os.row_lock_count), 
-                                SUM(os.row_lock_wait_count),
-                                SUM(os.row_lock_wait_in_ms), 
-                                SUM(os.page_lock_count), 
-                                SUM(os.page_lock_wait_count), 
-                                SUM(os.page_lock_wait_in_ms),
-                                SUM(os.index_lock_promotion_attempt_count), 
-                                SUM(os.index_lock_promotion_count), 
-								SUM(os.page_latch_wait_count),
-								SUM(os.page_latch_wait_in_ms),
-								SUM(os.page_io_latch_wait_count),								
-								SUM(os.page_io_latch_wait_in_ms), ';
-
-		    /* Get columnstore dictionary size - more info: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/2585 */
-			IF EXISTS (SELECT * FROM sys.all_objects WHERE name = 'column_store_dictionaries')
-				SET @dsql = @dsql + N' COALESCE((SELECT SUM (on_disk_size / 1024.0 / 1024) FROM ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_dictionaries dict WHERE dict.partition_id = ps.partition_id),0) AS reserved_dictionary_MB ';
-			ELSE
-				SET @dsql = @dsql + N' 0 AS reserved_dictionary_MB ';
-
+                            ' + CASE WHEN @SQLServerProductVersion NOT LIKE '9%' THEN N'par.data_compression_desc ' ELSE N'null as data_compression_desc ' END + N'
+';
 
             SET @dsql = @dsql + N'
 			FROM    ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_partition_stats AS ps  
@@ -1484,9 +1526,6 @@ BEGIN TRY
                                AND so.is_ms_shipped = 0 /*Exclude objects shipped by Microsoft*/
                                AND so.type <> ''TF'' /*Exclude table valued functions*/
 					JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.schemas AS s ON s.schema_id = so.schema_id
-                    LEFT JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_index_operational_stats('
-                + CAST(@DatabaseID AS NVARCHAR(10)) + N', NULL, NULL,NULL) AS os ON
-                    ps.object_id=os.object_id and ps.index_id=os.index_id and ps.partition_number=os.partition_number 
 			            OUTER APPLY (SELECT st.lock_escalation_desc
 			                         FROM ' + QUOTENAME(@DatabaseName) + N'.sys.tables st
 			                         WHERE st.object_id = ps.object_id
@@ -1506,7 +1545,82 @@ BEGIN TRY
 								le.lock_escalation_desc,
                             ' + CASE WHEN @SQLServerProductVersion NOT LIKE '9%' THEN N'par.data_compression_desc ' ELSE N'null as data_compression_desc ' END + N'
 			ORDER BY ps.object_id,  ps.index_id, ps.partition_number
-            OPTION    ( RECOMPILE );
+	        OPTION    ( RECOMPILE ' + 
+			CASE WHEN (PARSENAME(@SQLServerProductVersion, 4) ) > 12 THEN N', min_grant_percent = 1 '
+				ELSE N' '
+			END + N');
+
+            SET @d = CONVERT(VARCHAR(19), GETDATE(), 121)
+            RAISERROR (N''start getting data into #dm_db_index_operational_stats at %s.'',0,1, @d) WITH NOWAIT;
+            
+                       insert  into #dm_db_index_operational_stats
+           (
+                database_id
+              , object_id
+              , index_id
+              , partition_number
+              , hobt_id
+              , leaf_insert_count
+              , leaf_delete_count
+              , leaf_update_count
+              , range_scan_count
+              , singleton_lookup_count
+              , forwarded_fetch_count
+              , lob_fetch_in_pages
+              , lob_fetch_in_bytes
+              , row_overflow_fetch_in_pages
+              , row_overflow_fetch_in_bytes
+              , row_lock_count
+              , row_lock_wait_count
+              , row_lock_wait_in_ms
+              , page_lock_count
+              , page_lock_wait_count
+              , page_lock_wait_in_ms
+              , index_lock_promotion_attempt_count
+              , index_lock_promotion_count
+              , page_latch_wait_count
+              , page_latch_wait_in_ms
+              , page_io_latch_wait_count
+              , page_io_latch_wait_in_ms
+            )
+            
+            select os.database_id
+                 , os.object_id
+                 , os.index_id
+                 , os.partition_number ' + 
+				CASE WHEN (PARSENAME(@SQLServerProductVersion, 4) ) > 12 THEN N', os.hobt_id '
+					ELSE N', NULL AS hobt_id '
+				END + N'
+                 , os.leaf_insert_count
+                 , os.leaf_delete_count
+                 , os.leaf_update_count
+                 , os.range_scan_count
+                 , os.singleton_lookup_count
+                 , os.forwarded_fetch_count
+                 , os.lob_fetch_in_pages
+                 , os.lob_fetch_in_bytes
+                 , os.row_overflow_fetch_in_pages
+                 , os.row_overflow_fetch_in_bytes
+                 , os.row_lock_count
+                 , os.row_lock_wait_count
+                 , os.row_lock_wait_in_ms
+                 , os.page_lock_count
+                 , os.page_lock_wait_count
+                 , os.page_lock_wait_in_ms
+                 , os.index_lock_promotion_attempt_count
+                 , os.index_lock_promotion_count
+                 , os.page_latch_wait_count
+                 , os.page_latch_wait_in_ms
+                 , os.page_io_latch_wait_count
+                 , os.page_io_latch_wait_in_ms
+                from ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_index_operational_stats('+ CAST(@DatabaseID AS NVARCHAR(10)) +', NULL, NULL,NULL) AS os 
+	            OPTION    ( RECOMPILE ' + 
+				CASE WHEN (PARSENAME(@SQLServerProductVersion, 4) ) > 12 THEN N', min_grant_percent = 1 '
+					ELSE N' '
+				END + N');
+
+                SET @d = CONVERT(VARCHAR(19), GETDATE(), 121)
+                RAISERROR (N''finished getting data into #dm_db_index_operational_stats at %s.'',0,1, @d) WITH NOWAIT;
             ';
         END;
         ELSE
@@ -1605,6 +1719,7 @@ BEGIN TRY
                 PRINT SUBSTRING(@dsql, 32000, 36000);
                 PRINT SUBSTRING(@dsql, 36000, 40000);
             END;
+        EXEC sp_executesql @dsql; 
         INSERT    #IndexPartitionSanity ( [database_id],
                                           [object_id], 
 										  [schema_name],
@@ -1639,80 +1754,217 @@ BEGIN TRY
 								          page_io_latch_wait_count,								
 								          page_io_latch_wait_in_ms,
 										  reserved_dictionary_MB)
-                EXEC sp_executesql @dsql;
-        
+                select h.database_id, h.object_id, h.sname, h.index_id, h.partition_number, h.row_count, h.reserved_MB, h.reserved_LOB_MB, h.reserved_row_overflow_MB, h.lock_escalation_desc, h.data_compression_desc,
+                                SUM(os.leaf_insert_count), 
+                                SUM(os.leaf_delete_count), 
+                                SUM(os.leaf_update_count), 
+                                SUM(os.range_scan_count), 
+                                SUM(os.singleton_lookup_count),  
+                                SUM(os.forwarded_fetch_count),
+                                SUM(os.lob_fetch_in_pages), 
+                                SUM(os.lob_fetch_in_bytes), 
+                                SUM(os.row_overflow_fetch_in_pages),
+                                SUM(os.row_overflow_fetch_in_bytes), 
+                                SUM(os.row_lock_count), 
+                                SUM(os.row_lock_wait_count),
+                                SUM(os.row_lock_wait_in_ms), 
+                                SUM(os.page_lock_count), 
+                                SUM(os.page_lock_wait_count), 
+                                SUM(os.page_lock_wait_in_ms),
+                                SUM(os.index_lock_promotion_attempt_count), 
+                                SUM(os.index_lock_promotion_count), 
+								SUM(os.page_latch_wait_count),
+								SUM(os.page_latch_wait_in_ms),
+								SUM(os.page_io_latch_wait_count),								
+								SUM(os.page_io_latch_wait_in_ms)
+                                ,COALESCE((SELECT SUM (dict.on_disk_size / 1024.0 / 1024) FROM sys.column_store_dictionaries dict WHERE dict.partition_id = h.partition_id),0) AS reserved_dictionary_MB 
+                    from #dm_db_partition_stats_etc h
+                    left JOIN #dm_db_index_operational_stats as os ON
+                        h.object_id=os.object_id and h.index_id=os.index_id and h.partition_number=os.partition_number 
+                    group by h.database_id, h.object_id, h.sname, h.index_id, h.partition_number, h.partition_id, h.row_count, h.reserved_MB, h.reserved_LOB_MB, h.reserved_row_overflow_MB, h.lock_escalation_desc, h.data_compression_desc                          
+                
 		END; --End Check For @SkipPartitions = 0
 
 
-
+		IF @Mode NOT IN(1, 2)
+		BEGIN
         RAISERROR (N'Inserting data into #MissingIndexes',0,1) WITH NOWAIT;
         SET @dsql=N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;'
 
 
-		SET @dsql = @dsql + 'WITH ColumnNamesWithDataTypes AS(SELECT id.index_handle,id.object_id,cn.IndexColumnType,STUFF((SELECT '', '' + cn_inner.ColumnName + '' '' +
-			N'' {'' + CASE	 WHEN ty.name IN ( ''varchar'', ''char'' ) THEN ty.name + ''('' + CASE WHEN co.max_length = -1 THEN ''max'' ELSE CAST(co.max_length AS VARCHAR(25)) END + '')''
-								WHEN ty.name IN ( ''nvarchar'', ''nchar'' ) THEN ty.name + ''('' + CASE WHEN co.max_length = -1 THEN ''max'' ELSE CAST(co.max_length / 2 AS VARCHAR(25)) END + '')''
-								WHEN ty.name IN ( ''decimal'', ''numeric'' ) THEN ty.name + ''('' + CAST(co.precision AS VARCHAR(25)) + '', '' + CAST(co.scale AS VARCHAR(25)) + '')''
-								WHEN ty.name IN ( ''datetime2'' ) THEN ty.name + ''('' + CAST(co.scale AS VARCHAR(25)) + '')''
-								ELSE ty.name END + ''}''
-				FROM	' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_details AS id_inner
-				CROSS APPLY(
-					SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Equality'' AS IndexColumnType
-					FROM	(VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id_inner.equality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))) x(n)
-					CROSS APPLY n.nodes(''x'') node(v)
-				UNION ALL
-					SELECT	LTRIM(RTRIM(v.value(N''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Inequality'' AS IndexColumnType
-					FROM	(VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id_inner.inequality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))) x(n)
-					CROSS APPLY n.nodes(''x'') node(v)
-				UNION ALL
-					SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Included'' AS IndexColumnType
-					FROM	(VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id_inner.included_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))) x(n)
-					CROSS APPLY n.nodes(''x'') node(v)
-			)AS cn_inner'
-		+ /*split the string otherwise dsql cuts some of it out*/
-		'		JOIN	' + QUOTENAME(@DatabaseName) + N'.sys.columns AS co ON co.object_id = id_inner.object_id AND ''['' + co.name + '']'' = cn_inner.ColumnName
-				JOIN	' + QUOTENAME(@DatabaseName) + N'.sys.types AS ty ON ty.user_type_id = co.user_type_id 
+		SET @dsql = @dsql + '
+WITH 
+    ColumnNamesWithDataTypes AS
+(
+    SELECT 
+        id.index_handle,
+        id.object_id,
+        cn.IndexColumnType,
+        STUFF
+        (
+            (
+                SELECT 
+                    '', '' + 
+                    cn_inner.ColumnName + 
+                    '' '' +
+                    N'' {'' + 
+                        CASE     
+                            WHEN ty.name IN (''varchar'', ''char'') 
+                            THEN ty.name + 
+                                 ''('' + 
+                                 CASE 
+                                     WHEN co.max_length = -1 
+                                     THEN ''max'' 
+                                     ELSE CAST(co.max_length AS VARCHAR(25)) 
+                                 END + 
+                                 '')''
+                            WHEN ty.name IN (''nvarchar'', ''nchar'') 
+                            THEN ty.name + 
+                                 ''('' + 
+                                 CASE 
+                                     WHEN co.max_length = -1 
+                                     THEN ''max'' 
+                                     ELSE CAST(co.max_length / 2 AS VARCHAR(25)) 
+                                 END + 
+                                 '')''
+                            WHEN ty.name IN (''decimal'', ''numeric'') 
+                            THEN ty.name + 
+                                 ''('' + 
+                                 CAST(co.precision AS VARCHAR(25)) + 
+                                 '', '' + 
+                                 CAST(co.scale AS VARCHAR(25)) + 
+                                 '')''
+                            WHEN ty.name IN (''datetime2'') 
+                            THEN ty.name + 
+                                 ''('' + 
+                                 CAST(co.scale AS VARCHAR(25)) + 
+                                 '')''
+                            ELSE ty.name END + ''}''
+                FROM ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_details AS id_inner
+                CROSS APPLY
+                (
+                    SELECT    
+                        LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, 
+                        ''Equality'' AS IndexColumnType
+                    FROM 
+                    (
+                        VALUES 
+                            (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id_inner.equality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))
+                    ) x (n)
+                    CROSS APPLY n.nodes(''x'') node(v)
+                UNION ALL
+                    SELECT    
+                        LTRIM(RTRIM(v.value(N''(./text())[1]'', ''varchar(max)''))) AS ColumnName, 
+                        ''Inequality'' AS IndexColumnType
+                    FROM
+                    (
+                        VALUES 
+                            (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id_inner.inequality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))
+                    ) x (n)
+                    CROSS APPLY n.nodes(''x'') node(v)
+                UNION ALL
+                    SELECT    
+                        LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, 
+                        ''Included'' AS IndexColumnType
+                    FROM    
+                    (
+                        VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id_inner.included_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))
+                    ) x (n)
+                    CROSS APPLY n.nodes(''x'') node(v)
+                ) AS cn_inner        
+                JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.columns AS co 
+                  ON   co.object_id = id_inner.object_id 
+                  AND ''['' + co.name + '']'' = cn_inner.ColumnName
+                JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.types AS ty 
+                  ON ty.user_type_id = co.user_type_id 
                 WHERE id_inner.index_handle = id.index_handle
-				AND	id_inner.object_id = id.object_id
-				AND cn_inner.IndexColumnType = cn.IndexColumnType
-				FOR XML PATH('''')
-			 ),1,1,'''') AS ReplaceColumnNames
-            FROM ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_details AS id
-           CROSS APPLY(
-						SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Equality'' AS IndexColumnType
-						FROM	(VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id.equality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))) x(n)
-						CROSS APPLY n.nodes(''x'') node(v)
-				    UNION ALL
-						SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Inequality'' AS IndexColumnType
-						FROM	(VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id.inequality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))) x(n)
-						CROSS APPLY n.nodes(''x'') node(v)
-				    UNION ALL
-						SELECT	LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, ''Included'' AS IndexColumnType
-						FROM	(VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id.included_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))) x(n)
-						CROSS APPLY n.nodes(''x'') node(v)
-					)AS cn
-				GROUP BY	id.index_handle,id.object_id,cn.IndexColumnType
-				)
-                SELECT  id.database_id, id.object_id, @i_DatabaseName, sc.[name], so.[name], id.statement , gs.avg_total_user_cost, 
-                        gs.avg_user_impact, gs.user_seeks, gs.user_scans, gs.unique_compiles, id.equality_columns, id.inequality_columns, id.included_columns,
-				(
-                    SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
-                    FROM ColumnNamesWithDataTypes WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
-                    AND ColumnNamesWithDataTypes.object_id = id.object_id
-                    AND ColumnNamesWithDataTypes.IndexColumnType = ''Equality''
-                ) AS equality_columns_with_data_type
-                ,(
-                    SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
-                    FROM ColumnNamesWithDataTypes WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
-                    AND ColumnNamesWithDataTypes.object_id = id.object_id
-                    AND ColumnNamesWithDataTypes.IndexColumnType = ''Inequality''
-                ) AS inequality_columns_with_data_type
-                ,(
-                    SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
-                    FROM ColumnNamesWithDataTypes WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
-                    AND ColumnNamesWithDataTypes.object_id = id.object_id
-                    AND ColumnNamesWithDataTypes.IndexColumnType = ''Included''
-                ) AS included_columns_with_data_type '
+                AND   id_inner.object_id = id.object_id
+                AND   cn_inner.IndexColumnType = cn.IndexColumnType
+                FOR XML PATH('''')
+                ),
+                1,
+                1,
+                ''''
+             ) AS ReplaceColumnNames
+           FROM ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_details AS id
+           CROSS APPLY
+           (
+               SELECT    
+                   LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, 
+                   ''Equality'' AS IndexColumnType
+               FROM
+               (
+                   VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id.equality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))
+               ) x (n)
+               CROSS APPLY n.nodes(''x'') node(v)
+               UNION ALL
+               SELECT    
+                   LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, 
+                   ''Inequality'' AS IndexColumnType
+               FROM
+               (
+                   VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id.inequality_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))
+               ) x (n)
+               CROSS APPLY n.nodes(''x'') node(v)
+               UNION ALL
+               SELECT
+                   LTRIM(RTRIM(v.value(''(./text())[1]'', ''varchar(max)''))) AS ColumnName, 
+                   ''Included'' AS IndexColumnType
+               FROM
+               (
+                   VALUES (CONVERT(XML, N''<x>'' + REPLACE((SELECT CAST(id.included_columns AS nvarchar(max)) FOR XML PATH('''')), N'','', N''</x><x>'') + N''</x>''))
+               ) x (n)
+               CROSS APPLY n.nodes(''x'') node(v)
+           )AS cn
+           GROUP BY    
+               id.index_handle,
+               id.object_id,
+               cn.IndexColumnType
+)
+SELECT
+    *
+INTO #ColumnNamesWithDataTypes
+FROM ColumnNamesWithDataTypes
+OPTION(RECOMPILE);
+
+SELECT  
+    id.database_id, 
+    id.object_id, 
+    @i_DatabaseName, 
+    sc.[name], 
+    so.[name], 
+    id.statement, 
+    gs.avg_total_user_cost, 
+    gs.avg_user_impact, 
+    gs.user_seeks, 
+    gs.user_scans, 
+    gs.unique_compiles, 
+    id.equality_columns, 
+    id.inequality_columns, 
+    id.included_columns,
+    (
+        SELECT 
+            ColumnNamesWithDataTypes.ReplaceColumnNames 
+        FROM #ColumnNamesWithDataTypes ColumnNamesWithDataTypes 
+        WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
+        AND   ColumnNamesWithDataTypes.object_id = id.object_id
+        AND   ColumnNamesWithDataTypes.IndexColumnType = ''Equality''
+    ) AS equality_columns_with_data_type,
+    (
+        SELECT 
+            ColumnNamesWithDataTypes.ReplaceColumnNames 
+        FROM #ColumnNamesWithDataTypes ColumnNamesWithDataTypes 
+        WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
+        AND   ColumnNamesWithDataTypes.object_id = id.object_id
+        AND   ColumnNamesWithDataTypes.IndexColumnType = ''Inequality''
+    ) AS inequality_columns_with_data_type,
+    (
+        SELECT ColumnNamesWithDataTypes.ReplaceColumnNames 
+        FROM #ColumnNamesWithDataTypes ColumnNamesWithDataTypes 
+        WHERE ColumnNamesWithDataTypes.index_handle = id.index_handle
+        AND ColumnNamesWithDataTypes.object_id = id.object_id
+        AND ColumnNamesWithDataTypes.IndexColumnType = ''Included''
+    ) AS included_columns_with_data_type,';
 
 		/* Get the sample query plan if it's available, and if there are less than 1,000 rows in the DMV: */
         IF NOT EXISTS
@@ -1722,8 +1974,9 @@ BEGIN TRY
 			FROM sys.all_objects AS o
 			WHERE o.name = 'dm_db_missing_index_group_stats_query'
 	    )
-            SELECT
-                @dsql += N' , NULL AS sample_query_plan '
+        SELECT
+            @dsql += N'
+    NULL AS sample_query_plan'
         ELSE
 		BEGIN
             /* The DMV is only supposed to have 600 rows in it. If it's got more,
@@ -1734,46 +1987,56 @@ BEGIN TRY
 
             IF @MissingIndexPlans > 1000
                 BEGIN
-                SELECT @dsql += N' , NULL AS sample_query_plan /* Over 1000 plans found, skipping */ ';
+                SELECT @dsql += N'
+    NULL AS sample_query_plan /* Over 1000 plans found, skipping */';
                 RAISERROR (N'Over 1000 plans found in sys.dm_db_missing_index_group_stats_query - your SQL Server is hitting a bug: https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/3085',0,1) WITH NOWAIT;
                 END
             ELSE
                 SELECT
                     @dsql += N'
-                , sample_query_plan =
-                (
-                    SELECT TOP (1)
-                        p.query_plan
-                    FROM sys.dm_db_missing_index_group_stats gs 
-                    CROSS APPLY
-                    (
-                        SELECT TOP (1)
-                            s.plan_handle
-                        FROM ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_group_stats_query q 
-                        INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_exec_query_stats s
-                            ON q.query_plan_hash = s.query_plan_hash
-                        WHERE gs.group_handle = q.group_handle 
-                        ORDER BY (q.user_seeks + q.user_scans) DESC, s.total_logical_reads DESC
-                    ) q2
-                    CROSS APPLY sys.dm_exec_query_plan(q2.plan_handle) p
-                    WHERE ig.index_group_handle = gs.group_handle
-                ) '
+    sample_query_plan =
+    (
+        SELECT TOP (1)
+            p.query_plan
+        FROM sys.dm_db_missing_index_group_stats gs 
+        CROSS APPLY
+        (
+            SELECT TOP (1)
+                s.plan_handle
+            FROM ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_group_stats_query q 
+            INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_exec_query_stats s
+              ON q.query_plan_hash = s.query_plan_hash
+            WHERE gs.group_handle = q.group_handle 
+            ORDER BY 
+                (q.user_seeks + q.user_scans) DESC, 
+                s.total_logical_reads DESC
+        ) q2
+        CROSS APPLY sys.dm_exec_query_plan(q2.plan_handle) p
+        WHERE ig.index_group_handle = gs.group_handle
+    )'
 		END
         
         
 
-		SET @dsql = @dsql + N'FROM    ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_groups ig
-                        JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_details id ON ig.index_handle = id.index_handle
-                        JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_group_stats gs ON ig.index_group_handle = gs.group_handle
-                        JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.objects so on 
-                            id.object_id=so.object_id
-                        JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.schemas sc on 
-                            so.schema_id=sc.schema_id
-                WHERE    id.database_id = ' + CAST(@DatabaseID AS NVARCHAR(30)) + '
-                ' + CASE WHEN @ObjectID IS NULL THEN N'' 
-                    ELSE N'and id.object_id=' + CAST(@ObjectID AS NVARCHAR(30)) 
-                END +
-        N'OPTION (RECOMPILE);';
+		SET @dsql = @dsql + N'
+FROM ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_groups ig
+JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_details id 
+  ON ig.index_handle = id.index_handle
+JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_missing_index_group_stats gs 
+  ON ig.index_group_handle = gs.group_handle
+JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.objects so 
+  ON id.object_id=so.object_id
+JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.schemas sc 
+  ON so.schema_id=sc.schema_id
+WHERE id.database_id = ' + CAST(@DatabaseID AS NVARCHAR(30)) +
+CASE
+    WHEN @ObjectID IS NULL
+	THEN N'' 
+    ELSE N'
+AND   id.object_id = ' + CAST(@ObjectID AS NVARCHAR(30)) 
+END +
+N'
+OPTION (RECOMPILE);';
 
         IF @dsql IS NULL 
             RAISERROR('@dsql is null',16,1);
@@ -1795,6 +2058,7 @@ BEGIN TRY
                                     inequality_columns, included_columns, equality_columns_with_data_type, inequality_columns_with_data_type, 
                                     included_columns_with_data_type, sample_query_plan)
         EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
+		END;
 
         SET @dsql = N'
             SELECT DB_ID(N' + QUOTENAME(@DatabaseName,'''') + N') AS [database_id], 
@@ -1862,7 +2126,8 @@ BEGIN TRY
                                 [update_referential_action_desc], [delete_referential_action_desc] )
                 EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
 
-
+		IF @Mode NOT IN(1, 2)
+		BEGIN
         SET @dsql = N'
                 SELECT 
                     DB_ID(N' + QUOTENAME(@DatabaseName,'''') + N') AS [database_id], 
@@ -1901,7 +2166,7 @@ BEGIN TRY
         IF @dsql IS NULL 
             RAISERROR('@dsql is null',16,1);
 
-        RAISERROR (N'Inserting data into #ForeignKeys',0,1) WITH NOWAIT;
+        RAISERROR (N'Inserting data into #UnindexedForeignKeys',0,1) WITH NOWAIT;
         IF @Debug = 1
             BEGIN
                 PRINT SUBSTRING(@dsql, 0, 4000);
@@ -1932,8 +2197,11 @@ BEGIN TRY
             @dsql,
             N'@i_DatabaseName sysname',
             @DatabaseName;
+		END;
 
 
+		IF @Mode NOT IN(1, 2)
+		BEGIN
 		IF @SkipStatistics = 0 /* AND DB_NAME() = @DatabaseName /* Can only get stats in the current database - see https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/1947 */ */
 			BEGIN
 		IF  ((PARSENAME(@SQLServerProductVersion, 4) >= 12)
@@ -2091,9 +2359,11 @@ BEGIN TRY
 			
 			EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
 			END;
-
+			END;
 			END;
 
+		IF @Mode NOT IN(1, 2)
+		BEGIN
 			IF  (PARSENAME(@SQLServerProductVersion, 4) >= 10)
 			BEGIN
 			RAISERROR (N'Gathering Computed Column Info.',0,1) WITH NOWAIT;
@@ -2127,9 +2397,11 @@ BEGIN TRY
 			        ( database_id, [database_name], table_name, schema_name, column_name, is_nullable, definition, 
 					  uses_database_collation, is_persisted, is_computed, is_function, column_definition )			
 			EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
+			END;
+            END;
 
-			END; 
-			
+		IF @Mode NOT IN(1, 2)
+		BEGIN
 			RAISERROR (N'Gathering Trace Flag Information',0,1) WITH NOWAIT;
 			INSERT #TraceStatus
 			EXEC ('DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');			
@@ -2174,6 +2446,7 @@ BEGIN TRY
 									 history_table_name, start_column_name, end_column_name, period_name )
 					
 			EXEC sp_executesql @dsql;
+        END;
 
              SET @dsql=N'SELECT DB_ID(@i_DatabaseName) AS [database_id], 
              				   @i_DatabaseName AS database_name,
@@ -2200,6 +2473,8 @@ BEGIN TRY
              EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
 
 
+		IF @Mode NOT IN(1, 2)
+		BEGIN
             SET @dsql=N'SELECT DB_ID(@i_DatabaseName) AS [database_id], 
              				   @i_DatabaseName AS database_name,
                                s.name AS missing_schema_name,
@@ -2229,9 +2504,8 @@ BEGIN TRY
 
                 INSERT #FilteredIndexes ( database_id, database_name, schema_name, table_name, index_name, column_name )
                 EXEC sp_executesql @dsql, @params = N'@i_DatabaseName NVARCHAR(128)', @i_DatabaseName = @DatabaseName;
-
-
     END;
+	END;
 			
 END;                    
 END TRY
@@ -2591,6 +2865,7 @@ SELECT
 FROM #IndexSanity;
 	  
 RAISERROR (N'Populate #PartitionCompressionInfo.',0,1) WITH NOWAIT;
+IF OBJECT_ID('tempdb..#maps') IS NOT NULL DROP TABLE #maps;
 WITH maps
     AS
      (
@@ -2605,6 +2880,7 @@ SELECT *
 INTO   #maps
 FROM   maps;
 
+IF OBJECT_ID('tempdb..#grps') IS NOT NULL DROP TABLE #grps;
 WITH grps
     AS
      (
@@ -2958,7 +3234,8 @@ BEGIN
 				+ CASE WHEN @ShowPartitionRanges = 1 THEN N' COALESCE(range_start_op + '' '' + range_start + '' '', '''') + COALESCE(range_end_op + '' '' + range_end, '''') AS partition_range, ' ELSE N' ' END
 				+ N' row_group_id, total_rows, deleted_rows, ' 
 				+ @ColumnList
-				+ CASE WHEN @ShowPartitionRanges = 1 THEN N'
+				+ CASE WHEN @ShowPartitionRanges = 1 THEN N' ,
+                    state_desc, trim_reason_desc, transition_to_compressed_state_desc, has_vertipaq_optimization
 				FROM (
 					SELECT column_name, partition_number, row_group_id, total_rows, deleted_rows, details,
 						range_start_op,
@@ -2968,10 +3245,12 @@ BEGIN
 						range_end_op,
 						CASE
 							WHEN format_type IS NULL THEN CAST(range_end_value AS NVARCHAR(4000))
-							ELSE CONVERT(NVARCHAR(4000), range_end_value, format_type) END range_end' ELSE N' ' END + N'
+							ELSE CONVERT(NVARCHAR(4000), range_end_value, format_type) END range_end' ELSE N' ' END + N',
+                        state_desc, trim_reason_desc, transition_to_compressed_state_desc, has_vertipaq_optimization
 					FROM (
 						SELECT c.name AS column_name, p.partition_number, rg.row_group_id, rg.total_rows, rg.deleted_rows,
-							details = CAST(seg.min_data_id AS VARCHAR(20)) + '' to '' + CAST(seg.max_data_id AS VARCHAR(20)) + '', '' + CAST(CAST((seg.on_disk_size / 1024.0 / 1024) AS DECIMAL(18,0)) AS VARCHAR(20)) + '' MB''' 
+                            phys.state_desc, phys.trim_reason_desc, phys.transition_to_compressed_state_desc, phys.has_vertipaq_optimization,
+							details = CAST(seg.min_data_id AS VARCHAR(20)) + '' to '' + CAST(seg.max_data_id AS VARCHAR(20)) + '', '' + CAST(CAST(((COALESCE(d.on_disk_size,0) + COALESCE(seg.on_disk_size,0)) / 1024.0 / 1024) AS DECIMAL(18,0)) AS VARCHAR(20)) + '' MB''' 
 							+ CASE WHEN @ShowPartitionRanges = 1 THEN N',
 							CASE
 								WHEN pp.system_type_id IN (40, 41, 42, 43, 58, 61) THEN 126
@@ -2985,7 +3264,8 @@ BEGIN
 						FROM ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_row_groups rg 
 						INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.columns c ON rg.object_id = c.object_id
 						INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partitions p ON rg.object_id = p.object_id AND rg.partition_number = p.partition_number
-						INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.index_columns ic on ic.column_id = c.column_id AND ic.object_id = c.object_id AND ic.index_id = p.index_id ' + CASE WHEN @ShowPartitionRanges = 1 THEN N' 
+						INNER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.index_columns ic on ic.column_id = c.column_id AND ic.object_id = c.object_id AND ic.index_id = p.index_id 
+                        LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.dm_db_column_store_row_group_physical_stats phys ON rg.row_group_id = phys.row_group_id AND rg.object_id = phys.object_id AND rg.partition_number = phys.partition_number AND rg.index_id = phys.index_id ' + CASE WHEN @ShowPartitionRanges = 1 THEN N' 
 						LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.indexes i ON i.object_id = rg.object_id AND i.index_id = rg.index_id
 						LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
 						LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partition_functions pf ON pf.function_id = ps.function_id
@@ -2993,6 +3273,7 @@ BEGIN
 						LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partition_range_values prvs ON prvs.function_id = pf.function_id AND prvs.boundary_id = p.partition_number - 1
 						LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.partition_range_values prve ON prve.function_id = pf.function_id AND prve.boundary_id = p.partition_number ' ELSE N' ' END 
 						+ N' LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_segments seg ON p.partition_id = seg.partition_id AND ic.index_column_id = seg.column_id AND rg.row_group_id = seg.segment_id
+                        LEFT OUTER JOIN ' + QUOTENAME(@DatabaseName) + N'.sys.column_store_dictionaries d ON p.hobt_id = d.hobt_id AND c.column_id = d.column_id AND seg.secondary_dictionary_id = d.dictionary_id
 						WHERE rg.object_id = @ObjectID
 						AND rg.state IN (1, 2, 3)
 						AND c.name IN ( ' + @ColumnListWithApostrophes + N')' 
@@ -3029,6 +3310,9 @@ BEGIN
 		END
         RAISERROR(N'Done visualizing columnstore index contents.', 0,1) WITH NOWAIT;
     END
+
+    IF @ShowColumnstoreOnly = 1
+        RETURN;
 
 END; /* IF @TableName IS NOT NULL */
 
@@ -5894,52 +6178,77 @@ BEGIN
 						WHEN i.index_definition = '[HEAP]' THEN N''
 					    ELSE N'--' + ict.create_tsql END AS [Create TSQL], 
 					1 AS [Display Order]
+            INTO #Mode2Temp
 			FROM    #IndexSanity AS i --left join here so we don't lose disabled nc indexes
-					LEFT JOIN #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
-                    LEFT JOIN #IndexCreateTsql AS ict ON i.index_sanity_id = ict.index_sanity_id
-			ORDER BY    /* Shout out to DHutmacher */
-						/*DESC*/
-						CASE WHEN @SortOrder = N'rows' AND @SortDirection = N'desc' THEN sz.total_rows ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'reserved_mb' AND @SortDirection = N'desc' THEN sz.total_reserved_MB ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'size' AND @SortDirection = N'desc' THEN sz.total_reserved_MB ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'reserved_lob_mb' AND @SortDirection = N'desc' THEN sz.total_reserved_LOB_MB ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'lob' AND @SortDirection = N'desc' THEN sz.total_reserved_LOB_MB ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'total_row_lock_wait_in_ms' AND @SortDirection = N'desc' THEN COALESCE(sz.total_row_lock_wait_in_ms,0) ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'total_page_lock_wait_in_ms' AND @SortDirection = N'desc' THEN COALESCE(sz.total_page_lock_wait_in_ms,0) ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'lock_time' AND @SortDirection = N'desc' THEN (COALESCE(sz.total_row_lock_wait_in_ms,0) + COALESCE(sz.total_page_lock_wait_in_ms,0)) ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'total_reads' AND @SortDirection = N'desc' THEN total_reads ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'reads' AND @SortDirection = N'desc' THEN total_reads ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'user_updates' AND @SortDirection = N'desc' THEN user_updates ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'writes' AND @SortDirection = N'desc' THEN user_updates ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'reads_per_write' AND @SortDirection = N'desc' THEN reads_per_write ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'ratio' AND @SortDirection = N'desc' THEN reads_per_write ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'forward_fetches' AND @SortDirection = N'desc' THEN sz.total_forwarded_fetch_count ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'fetches' AND @SortDirection = N'desc' THEN sz.total_forwarded_fetch_count ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'create_date' AND @SortDirection = N'desc' THEN CONVERT(DATETIME, i.create_date) ELSE NULL END DESC,
-						CASE WHEN @SortOrder = N'modify_date' AND @SortDirection = N'desc' THEN CONVERT(DATETIME, i.modify_date) ELSE NULL END DESC,
-						/*ASC*/
-						CASE WHEN @SortOrder = N'rows' AND @SortDirection = N'asc' THEN sz.total_rows ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'reserved_mb' AND @SortDirection = N'asc' THEN sz.total_reserved_MB ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'size' AND @SortDirection = N'asc' THEN sz.total_reserved_MB ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'reserved_lob_mb' AND @SortDirection = N'asc' THEN sz.total_reserved_LOB_MB ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'lob' AND @SortDirection = N'asc' THEN sz.total_reserved_LOB_MB ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'total_row_lock_wait_in_ms' AND @SortDirection = N'asc' THEN COALESCE(sz.total_row_lock_wait_in_ms,0) ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'total_page_lock_wait_in_ms' AND @SortDirection = N'asc' THEN COALESCE(sz.total_page_lock_wait_in_ms,0) ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'lock_time' AND @SortDirection = N'asc' THEN (COALESCE(sz.total_row_lock_wait_in_ms,0) + COALESCE(sz.total_page_lock_wait_in_ms,0)) ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'total_reads' AND @SortDirection = N'asc' THEN total_reads ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'reads' AND @SortDirection = N'asc' THEN total_reads ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'user_updates' AND @SortDirection = N'asc' THEN user_updates ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'writes' AND @SortDirection = N'asc' THEN user_updates ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'reads_per_write' AND @SortDirection = N'asc' THEN reads_per_write ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'ratio' AND @SortDirection = N'asc' THEN reads_per_write ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'forward_fetches' AND @SortDirection = N'asc' THEN sz.total_forwarded_fetch_count ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'fetches' AND @SortDirection = N'asc' THEN sz.total_forwarded_fetch_count ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'create_date' AND @SortDirection = N'asc' THEN CONVERT(DATETIME, i.create_date) ELSE NULL END ASC,
-						CASE WHEN @SortOrder = N'modify_date' AND @SortDirection = N'asc' THEN CONVERT(DATETIME, i.modify_date) ELSE NULL END ASC,
-				i.[database_name], [Schema Name], [Object Name], [Index ID]
-			OPTION (RECOMPILE);
-  		END;
+			LEFT JOIN #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
+            LEFT JOIN #IndexCreateTsql AS ict ON i.index_sanity_id = ict.index_sanity_id
+			OPTION(RECOMPILE);
 
+			IF @@ROWCOUNT > 0
+            BEGIN
+			    SELECT
+			        sz.*
+			    FROM #Mode2Temp AS sz
+			    ORDER BY    /* Shout out to DHutmacher */
+			    			/*DESC*/
+			    			CASE WHEN @SortOrder = N'rows' AND @SortDirection = N'desc' THEN sz.[Rows] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'reserved_mb' AND @SortDirection = N'desc' THEN sz.[Reserved MB] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'size' AND @SortDirection = N'desc' THEN sz.[Reserved MB] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'reserved_lob_mb' AND @SortDirection = N'desc' THEN sz.[Reserved LOB MB] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'lob' AND @SortDirection = N'desc' THEN sz.[Reserved LOB MB] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'total_row_lock_wait_in_ms' AND @SortDirection = N'desc' THEN COALESCE(sz.[Row Lock Wait ms],0) ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'total_page_lock_wait_in_ms' AND @SortDirection = N'desc' THEN COALESCE(sz.[Page Lock Wait ms],0) ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'lock_time' AND @SortDirection = N'desc' THEN (COALESCE(sz.[Row Lock Wait ms],0) + COALESCE(sz.[Page Lock Wait ms],0)) ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'total_reads' AND @SortDirection = N'desc' THEN [Total Reads] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'reads' AND @SortDirection = N'desc' THEN [Total Reads] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'user_updates' AND @SortDirection = N'desc' THEN [User Updates] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'writes' AND @SortDirection = N'desc' THEN [User Updates] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'reads_per_write' AND @SortDirection = N'desc' THEN [Reads Per Write] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'ratio' AND @SortDirection = N'desc' THEN [Reads Per Write] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'forward_fetches' AND @SortDirection = N'desc' THEN sz.[Forwarded Fetches] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'fetches' AND @SortDirection = N'desc' THEN sz.[Forwarded Fetches] ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'create_date' AND @SortDirection = N'desc' THEN CONVERT(DATETIME, sz.[Create Date]) ELSE NULL END DESC,
+			    			CASE WHEN @SortOrder = N'modify_date' AND @SortDirection = N'desc' THEN CONVERT(DATETIME, sz.[Modify Date]) ELSE NULL END DESC,
+			    			/*ASC*/
+			    			CASE WHEN @SortOrder = N'rows' AND @SortDirection = N'asc' THEN sz.[Rows] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'reserved_mb' AND @SortDirection = N'asc' THEN sz.[Reserved MB] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'size' AND @SortDirection = N'asc' THEN sz.[Reserved MB] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'reserved_lob_mb' AND @SortDirection = N'asc' THEN sz.[Reserved LOB MB] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'lob' AND @SortDirection = N'asc' THEN sz.[Reserved LOB MB] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'total_row_lock_wait_in_ms' AND @SortDirection = N'asc' THEN COALESCE(sz.[Row Lock Wait ms],0) ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'total_page_lock_wait_in_ms' AND @SortDirection = N'asc' THEN COALESCE(sz.[Page Lock Wait ms],0) ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'lock_time' AND @SortDirection = N'asc' THEN (COALESCE(sz.[Row Lock Wait ms],0) + COALESCE(sz.[Page Lock Wait ms],0)) ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'total_reads' AND @SortDirection = N'asc' THEN [Total Reads] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'reads' AND @SortDirection = N'asc' THEN [Total Reads] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'user_updates' AND @SortDirection = N'asc' THEN [User Updates] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'writes' AND @SortDirection = N'asc' THEN [User Updates] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'reads_per_write' AND @SortDirection = N'asc' THEN [Reads Per Write] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'ratio' AND @SortDirection = N'asc' THEN [Reads Per Write] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'forward_fetches' AND @SortDirection = N'asc' THEN sz.[Forwarded Fetches] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'fetches' AND @SortDirection = N'asc' THEN sz.[Forwarded Fetches] ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'create_date' AND @SortDirection = N'asc' THEN CONVERT(DATETIME, sz.[Create Date]) ELSE NULL END ASC,
+			    			CASE WHEN @SortOrder = N'modify_date' AND @SortDirection = N'asc' THEN CONVERT(DATETIME, sz.[Modify Date]) ELSE NULL END ASC,
+			    	sz.[Database Name], [Schema Name], [Object Name], [Index ID]
+			    OPTION (RECOMPILE);
+			END
+			ELSE
+			BEGIN
+    			SELECT
+				    DatabaseDetails =
+					    N'Database ' +
+						ISNULL(@DatabaseName, DB_NAME()) +
+						N' has ' +
+						ISNULL(RTRIM(@Rowcount), 0) +
+						N' partitions.',
+					BringThePain =
+					    CASE
+						    WHEN @BringThePain IN (0, 1) AND ISNULL(@Rowcount, 0) = 0
+							THEN N'Check the database name, it looks like nothing is here.'
+							WHEN @BringThePain = 0 AND ISNULL(@Rowcount, 0) > 0
+							THEN N'Please re-run with @BringThePain = 1'
+						END;
+			END
+  		END;
     END; /* End @Mode=2 (index detail)*/
 
 
@@ -6168,7 +6477,8 @@ BEGIN
 
 
     END; /* End @Mode=3 (index detail)*/
-
+    SET @d = CONVERT(VARCHAR(19), GETDATE(), 121);
+    RAISERROR (N'finishing at %s',0,1, @d) WITH NOWAIT;
 END /* End @TableName IS NULL (mode 0/1/2/3/4) */
 END TRY
 
